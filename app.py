@@ -1,20 +1,3 @@
-import streamlit as st
-import upstox_client
-
-# Load the long-lived token
-config = upstox_client.Configuration()
-config.access_token = st.secrets["UPSTOX_EXTENDED_TOKEN"]
-
-# Initialize the Options API
-api_client = upstox_client.ApiClient(config)
-options_api = upstox_client.OptionsApi(api_client)
-
-# This will work for days/weeks depending on the token's validity
-def get_dashboard_data():
-    return options_api.get_put_call_option_chain(
-        instrument_key="NSE_INDEX|Nifty 50", 
-        expiry_date="2024-05-30"
-    )
 
 import streamlit as st
 import pandas as pd
@@ -89,6 +72,7 @@ for s in signals:
     """, unsafe_allow_html=True)
 
 st.caption("Data source: Upstox API V3 | Refresh every 30s")
+
 
 
 
