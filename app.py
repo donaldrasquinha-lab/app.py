@@ -1,3 +1,11 @@
+import upstox_client
+
+def get_live_data():
+    config = upstox_client.Configuration()
+    config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+    api = upstox_client.OptionsApi(upstox_client.ApiClient(config))
+    return api.get_put_call_option_chain(instrument_key="NSE_INDEX|Nifty 50", expiry_date="2024-05-30")
+
 import streamlit as st
 import pandas as pd
 
@@ -71,3 +79,4 @@ for s in signals:
     """, unsafe_allow_html=True)
 
 st.caption("Data source: Upstox API V3 | Refresh every 30s")
+
