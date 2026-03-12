@@ -1,47 +1,20 @@
 import streamlit as st
 import upstox_client
-from upstox_client.rest import ApiException
 
-def get_live_option_chain():
-    """
-    Fetches the live option chain from Upstox using 
-    credentials stored in Streamlit Secrets.
-    """
-    try:
-        # 1. Setup Configuration from Secrets
-        config = upstox_client.Configuration()
-        config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-        
-        # 2. Initialize API Client
-        api_client = upstox_client.ApiClient(config)
-        api_instance = upstox_client.OptionsApi(api_client)
-        
-        # 3. Fetch Data using parameters from Secrets
-        instrument = st.secrets["SYMBOL"]
-        expiry = st.secrets["EXPIRY"]
-        
-        api_response = api_instance.get_put_call_option_chain(
-            instrument_key=instrument, 
-            expiry_date=expiry
-        )
-        
-        return api_response.data
-        
-    except ApiException as e:
-        st.error(f"Upstox API Error: {e}")
-        return None
-    except KeyError:
-        st.error("Secret 'UPSTOX_ACCESS_TOKEN' not found in Streamlit Secrets!")
-        return None
+# Load the long-lived token
+config = upstox_client.Configuration()
+config.access_token = st.secrets["UPSTOX_EXTENDED_TOKEN"]
 
-# --- Streamlit UI ---
-st.title("Upstox Live Monitor")
+# Initialize the Options API
+api_client = upstox_client.ApiClient(config)
+options_api = upstox_client.OptionsApi(api_client)
 
-if st.button('Fetch Live Data'):
-    data = get_live_option_chain()
-    if data:
-        st.success("Data fetched successfully!")
-        st.write(data) # Displays the raw JSON/Object data
+# This will work for days/weeks depending on the token's validity
+def get_dashboard_data():
+    return options_api.get_put_call_option_chain(
+        instrument_key="NSE_INDEX|Nifty 50", 
+        expiry_date="2024-05-30"
+    )
 
 import streamlit as st
 import pandas as pd
@@ -116,5 +89,6 @@ for s in signals:
     """, unsafe_allow_html=True)
 
 st.caption("Data source: Upstox API V3 | Refresh every 30s")
+
 
 
