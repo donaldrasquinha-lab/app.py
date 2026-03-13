@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 import upstox_client
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
+
+# --- 1. AUTO-REFRESH (Every 60 Seconds) ---
+st_autorefresh(interval=60 * 1000, key="radar_refresh")
 
 # --- API HELPERS ---
 def get_api_client():
@@ -9,27 +13,27 @@ def get_api_client():
     config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
     return upstox_client.ApiClient(config)
 
+def safe_get_instrument(data_dict, key):
+    """Robustly fetch data using both | and : separators"""
+    alt_key = key.replace('|', ':')
+    return data_dict.get(key) or data_dict.get(alt_key)
+
 def get_live_market_data(index_key):
-    """
-    Fixed: Accesses the nested 'ohlc' object in MarketQuoteOHLCV3.
-    """
     try:
         api = upstox_client.MarketQuoteV3Api(get_api_client())
         ltp_resp = api.get_ltp(instrument_key=index_key)
         ohlc_resp = api.get_market_quote_ohlc(instrument_key=index_key, interval="1d")
         
-        resp_key = index_key.replace('|', ':')
-        spot_obj = ltp_resp.data.get(index_key, ltp_resp.data.get(resp_key))
+        spot_obj = safe_get_instrument(ltp_resp.data, index_key)
         spot = spot_obj.last_price if spot_obj else 0.0
         
-        ohlc_obj = ohlc_resp.data.get(index_key, ohlc_resp.data.get(resp_key))
+        ohlc_obj = safe_get_instrument(ohlc_resp.data, index_key)
         
-        # KEY FIX: Navigate into the nested 'ohlc' attribute
         if ohlc_obj and hasattr(ohlc_obj, 'ohlc'):
             prices = ohlc_obj.ohlc
             vwap_proxy = (prices.high + prices.low + prices.close) / 3
         else:
-            vwap_proxy = spot # Fallback if OHLC is missing
+            vwap_proxy = spot
             
         bias = "BULLISH" if spot >= vwap_proxy else "BEARISH"
         return spot, vwap_proxy, bias
@@ -54,7 +58,7 @@ st.markdown("""
     .card { background: rgba(30, 41, 59, 0.7); padding: 20px; border-radius: 15px; border-left: 10px solid #3b82f6; margin-bottom: 20px; }
     .bullish-card { border-left-color: #22c55e; }
     .bearish-card { border-left-color: #ef4444; }
-    .metric-label { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; }
+    .metric-label { color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; margin-bottom: 5px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -68,17 +72,25 @@ index_map = {
 index_choice = st.selectbox("Select Index", list(index_map.keys()))
 selected_key = index_map[index_choice]
 
-# Fetch Fixed Data
+# Fetch Market Data
 spot_price, vwap_val, market_bias = get_live_market_data(selected_key)
 badge_color = "#22c55e" if market_bias == "BULLISH" else "#ef4444"
 
-st.markdown(f"""
-    <div style="background:#1e293b; padding:15px; border-radius:12px; border:1px solid #334155; display:flex; justify-content:space-around; align-items:center; margin-bottom:25px;">
-        <div style="text-align:center;"><div class="metric-label">LIVE SPOT</div><div style="font-size:1.6rem; color:white; font-weight:bold;">₹{spot_price:,.2f}</div></div>
-        <div style="text-align:center;"><div class="metric-label">VWAP PROXY</div><div style="font-size:1.6rem; color:#3b82f6; font-weight:bold;">₹{vwap_val:,.2f}</div></div>
-        <div style="padding:5px 12px; border-radius:20px; font-weight:bold; background:{badge_color}22; color:{badge_color}; border:1px solid {badge_color};">{market_bias}</div>
-    </div>
-    """, unsafe_allow_html=True)
+# --- 2. VISUAL METRICS (Using Streamlit Columns) ---
+st.markdown('<div style="background:#1e293b; padding:20px; border-radius:12px; border:1px solid #334155; margin-bottom:25px;">', unsafe_allow_html=True)
+m_col1, m_col2, m_col3 = st.columns(3)
+
+with m_col1:
+    delta_val = spot_price - vwap_val
+    st.metric("LIVE SPOT", f"₹{spot_price:,.2f}", f"{delta_val:+.2f}")
+
+with m_col2:
+    st.metric("VWAP PROXY", f"₹{vwap_val:,.2f}")
+
+with m_col3:
+    # Colors BIAS label based on sentiment
+    st.metric("MARKET BIAS", market_bias, delta_color="normal" if market_bias == "BULLISH" else "inverse")
+st.markdown('</div>', unsafe_allow_html=True)
 
 # --- TRADE LOGIC ---
 if "oi_snapshots" not in st.session_state:
@@ -94,6 +106,7 @@ if expiry_list and spot_price > 0:
         resp = api.get_put_call_option_chain(instrument_key=selected_key, expiry_date=target_expiry)
         
         if resp and resp.data:
+            # Look at 5 strikes closest to spot
             target_strikes = sorted(resp.data, key=lambda x: abs(x.strike_price - spot_price))[:5]
             options_pool = []
             
@@ -104,6 +117,8 @@ if expiry_list and spot_price > 0:
                 if opt_data:
                     ikey = opt_data.instrument_key
                     curr_oi = opt_data.market_data.oi
+                    
+                    # Track Snapshot
                     if ikey not in st.session_state.oi_snapshots:
                         st.session_state.oi_snapshots[ikey] = {"oi": curr_oi, "time": datetime.now()}
                     
@@ -123,6 +138,7 @@ if expiry_list and spot_price > 0:
     except Exception as e:
         st.error(f"Option Chain Error: {e}")
 
+# --- DISPLAY MOMENTUM PICK ---
 if best_trade:
     s = best_trade
     card_class = "card bullish-card" if market_bias == "BULLISH" else "card bearish-card"
@@ -137,12 +153,12 @@ if best_trade:
                 <div class="metric-label">OI SURGE</div><div style="color:#eab308; font-weight:bold; font-size:1.3rem;">{s['surge']:+.2f}%</div>
             </div>
             <div style="background:#0f172a; padding:15px; border-radius:12px; text-align:center;">
-                <div class="metric-label">TRACKING</div><div style="color:white; font-weight:bold; font-size:1.3rem;">{s['time']}m</div>
+                <div class="metric-label">SNAPSHOT AGE</div><div style="color:white; font-weight:bold; font-size:1.3rem;">{s['time']}m</div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 else:
-    st.info("Recording live data... Refresh in 1 minute to see momentum surge.")
+    st.info("Recording live data... OI Surge will appear after the next 60s update.")
 
-st.caption(f"Status: Connected | Expiry: {expiry_list[0] if expiry_list else 'N/A'}")
+st.caption(f"Status: Connected | Expiry: {expiry_list[0] if expiry_list else 'N/A'} | Last Update: {datetime.now().strftime('%H:%M:%S')}")
