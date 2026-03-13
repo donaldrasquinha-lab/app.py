@@ -3,27 +3,32 @@ import upstox_client
 import threading
 import time
 
-# --- 1. GLOBAL STORE & STATE ---
-# We use a global dict because background threads can't access st.session_state directly
-if "live_data" not in st.session_state:
-    st.session_state.live_data = {"price": 0.0, "time": "Connecting...", "symbol": ""}
+# --- 1. INITIALIZE SESSION STATE ---
+if "live_price" not in st.session_state:
+    st.session_state.live_price = 0.0
+    st.session_state.last_update = "Connecting..."
 
-# Global object to hold the current tick
-SHARED_TICK = {"price": 0.0, "time": "Waiting...", "error": None}
+# Global dictionary to bridge the background thread and the UI
+# Threads in Streamlit cannot access st.session_state directly
+SHARED_DATA = {"price": 0.0, "time": "Waiting..."}
 
-# --- 2. SECRETS CHECK ---
-if "UPSTOX_ACCESS_TOKEN" not in st.secrets:
-    st.error("Missing 'UPSTOX_ACCESS_TOKEN' in Streamlit Secrets!")
-    st.stop()
+# --- 2. AUTHENTICATION & CONNECTION ---
+# This part connects to your token from the secrets
+def get_api_client():
+    try:
+        access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+        configuration = upstox_client.Configuration()
+        configuration.access_token = access_token
+        return upstox_client.ApiClient(configuration)
+    except Exception as e:
+        st.error(f"Authentication Failed: Check your Token in Secrets. Error: {e}")
+        st.stop()
 
-# Upstox Configuration
-conf = upstox_client.Configuration()
-conf.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-api_client = upstox_client.ApiClient(conf)
+api_client = get_api_client()
 
-# --- 3. UI SETUP ---
-st.set_page_config(page_title="Upstox Live Spot", layout="centered")
-st.title("🎯 Live Index Spot Price")
+# --- 3. UI LAYOUT ---
+st.set_page_config(page_title="Upstox Live Spot", page_icon="📈")
+st.title("🎯 Upstox Live Index Tracker")
 
 INDEX_MAP = {
     "Nifty 50": "NSE_INDEX|Nifty 50",
@@ -32,64 +37,53 @@ INDEX_MAP = {
     "SENSEX": "BSE_INDEX|SENSEX"
 }
 
-selected_label = st.selectbox("Select Index to Monitor", list(INDEX_MAP.keys()))
+selected_label = st.selectbox("Select Index", list(INDEX_MAP.keys()))
 selected_key = INDEX_MAP[selected_label]
 
-# --- 4. WEBSOCKET HANDLERS ---
+# --- 4. WEBSOCKET HANDLER ---
 def on_message(message):
-    """Update global dict when a new tick arrives."""
+    """Callback function when a new price tick arrives from Upstox."""
     if "feeds" in message and selected_key in message["feeds"]:
-        feed = message["feeds"][selected_key]
-        if "ltpc" in feed:
-            SHARED_TICK["price"] = feed["ltpc"]["ltp"]
-            SHARED_TICK["time"] = time.strftime("%H:%M:%S")
+        tick = message["feeds"][selected_key]
+        if "ltpc" in tick:
+            SHARED_DATA["price"] = tick["ltpc"]["ltp"]
+            SHARED_DATA["time"] = time.strftime("%H:%M:%S")
 
-def run_v3_streamer():
-    """Background thread for WebSocket."""
+def start_websocket_thread():
+    """Runs the Upstox Streamer in the background."""
     try:
+        # MarketDataStreamerV3 is the official way to get live data
         streamer = upstox_client.MarketDataStreamerV3(api_client)
         streamer.on("message", on_message)
         streamer.connect()
-        # Initial subscription
         streamer.subscribe([selected_key], "ltpc")
         
-        # Keep thread alive and handle index changes
-        current_subscribed = selected_key
+        # Keep tracking if the user changes the dropdown index
+        last_subscribed = selected_key
         while True:
-            if current_subscribed != selected_key:
-                # Unsubscribe old, subscribe new
-                streamer.unsubscribe([current_subscribed])
+            if last_subscribed != selected_key:
+                streamer.unsubscribe([last_subscribed])
                 streamer.subscribe([selected_key], "ltpc")
-                current_subscribed = selected_key
-            time.sleep(1)
+                last_subscribed = selected_key
+            time.sleep(0.5)
     except Exception as e:
-        SHARED_TICK["error"] = str(e)
+        print(f"WebSocket Error: {e}")
 
-# Start WebSocket thread once
+# Start the background thread once per session
 if "ws_started" not in st.session_state:
-    threading.Thread(target=run_v3_streamer, daemon=True).start()
+    threading.Thread(target=start_websocket_thread, daemon=True).start()
     st.session_state.ws_started = True
 
-# --- 5. DISPLAY LOGIC ---
-# Sync shared data to session state
-st.session_state.live_data.update(SHARED_TICK)
+# --- 5. DATA SYNC & DISPLAY ---
+# Pull data from the global SHARED_DATA into Streamlit's UI state
+st.session_state.live_price = SHARED_DATA["price"]
+st.session_state.last_update = SHARED_DATA["time"]
 
-if st.session_state.live_data["error"]:
-    st.error(f"Error: {st.session_state.live_data['error']}")
+# Display the Big Metric
+price_display = f"₹{st.session_state.live_price:,.2f}" if st.session_state.live_price > 0 else "Fetching..."
+st.metric(label=f"Live {selected_label} Spot", value=price_display)
+st.caption(f"Last updated at: {st.session_state.last_update}")
 
-# Display Big Metric
-price = st.session_state.live_data["price"]
-st.metric(
-    label=f"Live Spot: {selected_label}", 
-    value=f"₹{price:,.2f}" if price > 0 else "Fetching..."
-)
-
-st.caption(f"Last update at: {st.session_state.live_data['time']}")
-
-# Manual Refresh button for safety
-if st.button("Refresh Connection"):
-    st.rerun()
-
-# Auto-refresh UI every 1 second
+# Auto-refresh the UI every 1 second to show the moving price
 time.sleep(1)
 st.rerun()
