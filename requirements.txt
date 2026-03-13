@@ -1,1 +1,4 @@
 upstox-python-sdk
+upstox-python
+streamlit
+pandas
