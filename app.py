@@ -1,104 +1,82 @@
-import streamlit as st
 import upstox_client
-import threading
-import time
-import urllib.parse
 
-# --- 1. CONFIGURATION ---
-# Replace with your actual credentials from Developer Console
-CLIENT_ID = "YOUR_CLIENT_ID"
-CLIENT_SECRET = "YOUR_CLIENT_SECRET"
-REDIRECT_URI = "http://localhost:8501" # Must match Developer Console
+def get_live_data():
+    config = upstox_client.Configuration()
+    config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+    api = upstox_client.OptionsApi(upstox_client.ApiClient(config))
+    return api.get_put_call_option_chain(instrument_key="NSE_INDEX|Nifty 50", expiry_date="2024-05-30")
 
-# --- 2. SESSION STATE INITIALIZATION ---
-if "access_token" not in st.session_state:
-    st.session_state.access_token = None
-if "live_data" not in st.session_state:
-    st.session_state.live_data = {"ltp": 0.0, "time": "Waiting..."}
 
-# --- 3. LOGIN PAGE LOGIC ---
-def login_page():
-    st.title("🔐 Upstox Secure Login")
-    st.write("Click below to authenticate with your Upstox account.")
+import streamlit as st
+import pandas as pd
+
+# Mobile UI Configuration
+st.set_page_config(page_title="Options Alpha", layout="centered")
+
+# Custom CSS for Mobile Glassmorphism UI
+st.markdown("""
+    <style>
+    .main { background-color: #0e1117; }
+    .stNumberInput input { background-color: #1e293b !important; color: white !important; }
+    .card {
+        background: rgba(30, 41, 59, 0.7);
+        padding: 20px;
+        border-radius: 15px;
+        border-left: 5px solid #22c55e;
+        margin-bottom: 20px;
+    }
+    .put-card { border-left: 5px solid #ef4444; }
+    .metric-label { color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; }
+    .metric-value { color: #3b82f6; font-weight: bold; font-size: 1.2rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+st.title("🎯 Options Momentum")
+
+# --- INPUT SECTION (Optimized for Thumb-usage) ---
+col1, col2 = st.columns(2)
+with col1:
+    capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
+with col2:
+    target_pct = st.number_input("Target Return %", value=20, step=5)
+
+# --- MOCK DATA (Replace with Upstox API calls) ---
+# In a live setup, use: upstox_client.OptionsApi().get_put_call_option_chain()
+signals = [
+    {"type": "CALL", "strike": "NIFTY 22500 CE", "ltp": 142.0, "oi_chg": "+24%", "gamma": "High", "iv": 14.2},
+    {"type": "PUT", "strike": "NIFTY 22300 PE", "ltp": 88.5, "oi_chg": "+18%", "gamma": "Med", "iv": 18.5}
+]
+
+# --- LIVE SIGNAL CARDS ---
+for s in signals:
+    border_class = "card" if s['type'] == "CALL" else "card put-card"
+    color = "#22c55e" if s['type'] == "CALL" else "#ef4444"
     
-    # Official Upstox Login URL
-    auth_url = f"https://api.upstox.com{CLIENT_ID}&redirect_uri={REDIRECT_URI}&response_type=code"
-    
-    st.link_button("Login with Upstox", auth_url)
-    
-    # Check if we were just redirected back with a code
-    query_params = st.query_params
-    if "code" in query_params:
-        auth_code = query_params["code"]
-        st.info("🔄 Exchanging authorization code for access token...")
-        generate_token(auth_code)
+    # Calculations
+    lot_size = 50
+    cost_per_lot = s['ltp'] * lot_size
+    max_lots = int(capital // cost_per_lot)
+    exit_price = s['ltp'] * (1 + (target_pct / 100))
+    est_profit = (exit_price - s['ltp']) * (max_lots * lot_size)
 
-def generate_token(code):
-    """Exchanges auth code for a valid access token."""
-    try:
-        api_instance = upstox_client.LoginApi()
-        api_response = api_instance.token(
-            api_version='2.0',
-            code=code,
-            client_id=CLIENT_ID,
-            client_secret=CLIENT_SECRET,
-            redirect_uri=REDIRECT_URI,
-            grant_type='authorization_code'
-        )
-        st.session_state.access_token = api_response.access_token
-        st.success("✅ Login Successful!")
-        st.rerun()
-    except Exception as e:
-        st.error(f"❌ Token Generation Failed: {e}")
+    st.markdown(f"""
+    <div class="{border_class}">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2 style="color: {color}; margin:0;">{s['strike']}</h2>
+            <span style="color: white; font-family: monospace;">LTP: ₹{s['ltp']}</span>
+        </div>
+        <hr style="opacity: 0.1; margin: 10px 0;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center;">
+            <div><div class="metric-label">OI Change</div><div class="metric-value">{s['oi_chg']}</div></div>
+            <div><div class="metric-label">IV</div><div class="metric-value" style="color: #eab308;">{s['iv']}</div></div>
+            <div><div class="metric-label">Gamma</div><div class="metric-value" style="color: #a855f7;">{s['gamma']}</div></div>
+        </div>
+        <div style="background: #0f172a; margin-top: 15px; padding: 10px; border-radius: 10px; display: grid; grid-template-columns: 1fr 1fr 1fr; text-align: center;">
+            <div><small style="color:#64748b">LOTS</small><br><b>{max_lots}</b></div>
+            <div><small style="color:#64748b">EXIT @</small><br><b style="color:#22c55e">{exit_price:.2f}</b></div>
+            <div><small style="color:#64748b">PROFIT</small><br><b>₹{int(est_profit)}</b></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# --- 4. LIVE DATA LOGIC ---
-def on_message(message):
-    """Callback for MarketDataStreamerV3."""
-    if "feeds" in message:
-        # Example for Nifty 50
-        feed = message["feeds"].get("NSE_INDEX|Nifty 50")
-        if feed and "ltpc" in feed:
-            st.session_state.live_data["ltp"] = feed["ltpc"]["ltp"]
-            st.session_state.live_data["time"] = time.strftime("%H:%M:%S")
-
-def start_streamer():
-    """Background thread to handle V3 WebSocket connection."""
-    try:
-        conf = upstox_client.Configuration()
-        conf.access_token = st.session_state.access_token
-        
-        # V3 Streamer handles binary Protobuf decoding automatically
-        streamer = upstox_client.MarketDataStreamerV3(
-            upstox_client.ApiClient(conf)
-        )
-        streamer.on("message", on_message)
-        streamer.connect()
-        streamer.subscribe(["NSE_INDEX|Nifty 50"], "ltpc")
-        
-        while True: time.sleep(1)
-    except Exception as e:
-        print(f"Streamer Error: {e}")
-
-# --- 5. MAIN DASHBOARD ---
-if not st.session_state.access_token:
-    login_page()
-else:
-    st.title("📈 Real-Time Dashboard")
-    st.write(f"Logged in with token: `{st.session_state.access_token[:10]}...`")
-    
-    # Start WebSocket thread once
-    if "ws_active" not in st.session_state:
-        threading.Thread(target=start_streamer, daemon=True).start()
-        st.session_state.ws_active = True
-
-    # Display Metrics
-    st.metric(label="Nifty 50 Spot", value=f"₹{st.session_state.live_data['ltp']:,.2f}")
-    st.caption(f"Last updated: {st.session_state.live_data['time']}")
-    
-    if st.button("Logout"):
-        st.session_state.access_token = None
-        st.query_params.clear()
-        st.rerun()
-
-    time.sleep(1)
-    st.rerun()
+st.caption("Data source: Upstox API V3 | Refresh every 30s")
