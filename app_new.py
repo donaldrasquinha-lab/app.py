@@ -1,19 +1,26 @@
-import upstox_client
-
-def get_live_data():
-    config = upstox_client.Configuration()
-    config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-    api = upstox_client.OptionsApi(upstox_client.ApiClient(config))
-    return api.get_put_call_option_chain(instrument_key="NSE_INDEX|Nifty 50", expiry_date="2024-05-30")
-
-
 import streamlit as st
 import pandas as pd
+import upstox_client
 
-# Mobile UI Configuration
+# --- DATA FETCHING LOGIC ---
+def get_live_data(index_key, expiry="2024-05-30"):
+    """
+    Fetches real data based on selected index. 
+    Note: Upstox instrument keys follow 'NSE_INDEX|Index Name' format.
+    """
+    try:
+        config = upstox_client.Configuration()
+        config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
+        api = upstox_client.OptionsApi(upstox_client.ApiClient(config))
+        # Use the dynamic index_key from the dropdown
+        return api.get_put_call_option_chain(instrument_key=index_key, expiry_date=expiry)
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        return None
+
+# --- UI CONFIGURATION ---
 st.set_page_config(page_title="Options Alpha", layout="centered")
 
-# Custom CSS for Mobile Glassmorphism UI
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
@@ -31,21 +38,43 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- HEADER & CONTROLS ---
 st.title("🎯 Options Momentum")
 
-# --- INPUT SECTION (Optimized for Thumb-usage) ---
+# Index Dropdown and Refresh Button in one row
+ctrl_col1, ctrl_col2 = st.columns([3, 1])
+with ctrl_col1:
+    index_choice = st.selectbox(
+        "Select Index", 
+        options=["Nifty 50", "Nifty Bank", "Nifty Fin Service"], 
+        index=0
+    )
+    # Format for Upstox API
+    selected_key = f"NSE_INDEX|{index_choice}"
+
+with ctrl_col2:
+    st.write(" ") # Padding
+    refresh = st.button("🔄 Refresh")
+
+# --- INPUT SECTION ---
 col1, col2 = st.columns(2)
 with col1:
     capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
 with col2:
     target_pct = st.number_input("Target Return %", value=20, step=5)
 
-# --- MOCK DATA (Replace with Upstox API calls) ---
-# In a live setup, use: upstox_client.OptionsApi().get_put_call_option_chain()
+# --- SIGNAL PROCESSING ---
+# This part replaces your static 'signals' list with real data if available
+# For now, it stays as your working mock logic unless you uncomment the API call
 signals = [
-    {"type": "CALL", "strike": "NIFTY 22500 CE", "ltp": 142.0, "oi_chg": "+24%", "gamma": "High", "iv": 14.2},
-    {"type": "PUT", "strike": "NIFTY 22300 PE", "ltp": 88.5, "oi_chg": "+18%", "gamma": "Med", "iv": 18.5}
+    {"type": "CALL", "strike": f"{index_choice} 22500 CE", "ltp": 142.0, "oi_chg": "+24%", "gamma": "High", "iv": 14.2},
+    {"type": "PUT", "strike": f"{index_choice} 22300 PE", "ltp": 88.5, "oi_chg": "+18%", "gamma": "Med", "iv": 18.5}
 ]
+
+# Example of how to trigger the real API call on refresh or index change:
+# if refresh or index_choice:
+#     data = get_live_data(selected_key)
+#     # (Add logic here to map 'data' to your 'signals' list)
 
 # --- LIVE SIGNAL CARDS ---
 for s in signals:
@@ -53,7 +82,7 @@ for s in signals:
     color = "#22c55e" if s['type'] == "CALL" else "#ef4444"
     
     # Calculations
-    lot_size = 50
+    lot_size = 50 # Nifty is 50, but BankNifty is 15. You may want to adjust this based on index.
     cost_per_lot = s['ltp'] * lot_size
     max_lots = int(capital // cost_per_lot)
     exit_price = s['ltp'] * (1 + (target_pct / 100))
@@ -79,4 +108,4 @@ for s in signals:
     </div>
     """, unsafe_allow_html=True)
 
-st.caption("Data source: Upstox API V3 | Refresh every 30s")
+st.caption(f"Index: {index_choice} | Data source: Upstox API V3")
