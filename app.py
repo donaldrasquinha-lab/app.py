@@ -4,48 +4,62 @@ import urllib.parse
 from upstox_client.rest import ApiException
 
 # 1. UI Configuration
-st.set_page_config(page_title="Nifty Live Alpha", layout="centered")
+st.set_page_config(page_title="Nifty Alpha Live", layout="centered")
 
-# Custom CSS for Professional Mobile-Friendly UI
+# Custom CSS for Professional Mobile UI
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
-    /* Custom Styling for the Spot Price Metric Container */
     [data-testid="stMetric"] {
         background-color: #1e293b;
-        padding: 20px;
-        border-radius: 15px;
+        padding: 15px;
+        border-radius: 12px;
         border: 1px solid #334155;
-        margin-bottom: 25px;
     }
-    .card { background: rgba(30, 41, 59, 0.7); padding: 15px; border-radius: 12px; border-left: 5px solid #22c55e; margin-bottom: 15px; }
+    .card {
+        background: rgba(30, 41, 59, 0.7);
+        padding: 15px;
+        border-radius: 12px;
+        border-left: 5px solid #22c55e;
+        margin-bottom: 15px;
+    }
     .put-card { border-left: 5px solid #ef4444; }
     .metric-label { color: #94a3b8; font-size: 0.7rem; text-transform: uppercase; }
     .metric-value { color: #3b82f6; font-weight: bold; font-size: 1rem; }
     </style>
     """, unsafe_allow_html=True)
 
-# 2. HELPER: Fetch Nifty Spot Price
+# 2. Login Logic
+client_id = st.secrets["UPSTOX_CLIENT_ID"]
+redirect_uri = st.secrets["UPSTOX_REDIRECT_URI"]
+login_url = (
+    f"https://api.upstox.com?"
+    f"client_id={client_id}&redirect_uri={urllib.parse.quote(redirect_uri)}"
+)
+st.link_button("🔑 Login to Upstox", login_url)
+
+# 3. Fetch Spot Price & Daily Change
 def get_nifty_spot():
     try:
         config = upstox_client.Configuration()
         config.access_token = st.secrets["UPSTOX_EXTENDED_TOKEN"]
         api_instance = upstox_client.MarketQuoteApi(upstox_client.ApiClient(config))
         
-        # 'NSE_INDEX|Nifty 50' is the standard instrument key for spot
+        # Fetching Full Quote for Nifty Index
         response = api_instance.get_full_market_quote(st.secrets["SYMBOL"], '2.0')
         
         if response and response.data:
-            quote = response.data[st.secrets["SYMBOL"]]
-            ltp = quote.last_price
-            prev_close = quote.close
+            data = response.data[st.secrets["SYMBOL"]]
+            ltp = data.last_price
+            prev_close = data.close
             change = ltp - prev_close
-            change_pct = (change / prev_close) * 100
-            return ltp, change, change_pct
+            pct_change = (change / prev_close) * 100
+            return ltp, change, pct_change
+        return None, None, None
     except Exception:
         return None, None, None
 
-# 3. HELPER: Fetch Option Chain
+# 4. Fetch Option Chain Data (Fixed Attribute Errors)
 def fetch_option_chain():
     try:
         config = upstox_client.Configuration()
@@ -57,79 +71,86 @@ def fetch_option_chain():
             expiry_date=st.secrets["EXPIRY"]
         )
         
-        processed = []
-        if response and response.data:
-            for row in response.data:
+        processed_signals = []
+        if response and hasattr(response, 'data') and response.data:
+            for strike_row in response.data:
+                # Check both Call (CE) and Put (PE) in the strike row
                 for side in ['call_options', 'put_options']:
-                    opt = getattr(row, side, None)
-                    if opt:
-                        market = getattr(opt, 'market_data', None)
-                        greeks = getattr(opt, 'option_greeks', None)
-                        processed.append({
+                    opt_data = getattr(strike_row, side, None)
+                    
+                    if opt_data:
+                        # Access nested market data and greeks
+                        market = getattr(opt_data, 'market_data', None)
+                        greeks = getattr(opt_data, 'option_greeks', None)
+                        
+                        processed_signals.append({
                             "type": "CE" if side == 'call_options' else "PE",
-                            "strike": getattr(opt, 'trading_symbol', 'N/A'),
+                            "strike": getattr(opt_data, 'trading_symbol', 'N/A'),
                             "ltp": getattr(market, 'ltp', 0.0),
                             "oi_chg": f"{getattr(market, 'oi_change_percentage', 0.0):.1f}%",
                             "gamma": f"{getattr(greeks, 'gamma', 0.0):.4f}",
                             "iv": round(getattr(greeks, 'iv', 0.0), 2)
                         })
-        return processed
+        return processed_signals
     except Exception as e:
-        st.error(f"Chain Error: {str(e)}")
+        st.error(f"⚠️ Chain Fetch Error: {str(e)}")
         return []
 
-# 4. MAIN UI EXECUTION
+# 5. UI Layout Execution
 st.title("🎯 Options Momentum")
 
-# Fetch Spot Price First
-spot_ltp, spot_change, spot_pct = get_nifty_spot()
-
-# Integrated Spot Display
-if spot_ltp:
+# Display Integrated Spot Price at the top
+spot_price, diff, diff_pct = get_nifty_spot()
+if spot_price:
     st.metric(
         label="NIFTY 50 LIVE SPOT", 
-        value=f"₹{spot_ltp:,.2f}", 
-        delta=f"{spot_change:+.2f} ({spot_pct:+.2f}%)"
+        value=f"₹{spot_price:,.2f}", 
+        delta=f"{diff:+.2f} ({diff_pct:+.2f}%)"
     )
 else:
-    st.error("Could not fetch Nifty Spot price. Check your API Token.")
+    st.warning("Spot price currently unavailable. Check your API Token.")
 
-# Trading Controls
+# User Inputs
 capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
 target_pct = st.number_input("Target Return %", value=20, step=5)
 
 if st.button('🔄 Refresh Live Data'):
-    signals = fetch_option_chain()
+    with st.spinner("Fetching data..."):
+        signals = fetch_option_chain()
     
     if not signals:
-        st.warning(f"No chain data for {st.secrets['EXPIRY']}. Token might be expired.")
+        st.error(f"No chain data for {st.secrets['EXPIRY']}. Is the token expired?")
     else:
+        # Show top 10 contracts
         for s in signals[:10]:
             is_call = s['type'] == "CE"
             color = "#22c55e" if is_call else "#ef4444"
-            lot_size = 75 # Standard Nifty Lot Size
+            
+            # Calculations (Nifty Lot Size = 75)
+            lot_size = 75 
             exit_price = s['ltp'] * (1 + (target_pct / 100))
             max_lots = int(capital // (s['ltp'] * lot_size)) if s['ltp'] > 0 else 0
+            est_profit = (exit_price - s['ltp']) * (max_lots * lot_size)
             
             st.markdown(f"""
             <div class="card {'put-card' if not is_call else ''}">
-                <div style="display: flex; justify-content: space-between;">
-                    <b style="color: {color};">{s['strike']}</b>
-                    <b style="color: white;">₹{s['ltp']}</b>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <b style="color: {color}; font-size: 1rem;">{s['strike']}</b>
+                    <b style="color: white; font-family: monospace;">₹{s['ltp']}</b>
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; margin-top: 10px; text-align: center;">
                     <div><div class="metric-label">OI Chg</div><div class="metric-value">{s['oi_chg']}</div></div>
-                    <div><div class="metric-label">IV</div><div class="metric-value">{s['iv']}</div></div>
-                    <div><div class="metric-label">Gamma</div><div class="metric-value">{s['gamma']}</div></div>
+                    <div><div class="metric-label">IV</div><div class="metric-value" style="color: #eab308;">{s['iv']}</div></div>
+                    <div><div class="metric-label">Gamma</div><div class="metric-value" style="color: #a855f7;">{s['gamma']}</div></div>
                 </div>
-                <div style="background: #0f172a; margin-top: 10px; padding: 8px; border-radius: 8px; display: grid; grid-template-columns: 1fr 1fr 1fr; text-align: center;">
-                    <div><small>LOTS</small><br><b>{max_lots}</b></div>
-                    <div><small>EXIT</small><br><b style="color:#22c55e">{exit_price:.2f}</b></div>
-                    <div><small>PROFIT</small><br><b>₹{int((exit_price-s['ltp'])*max_lots*lot_size) if max_lots > 0 else 0}</b></div>
+                <div style="background: #0f172a; margin-top: 10px; padding: 10px; border-radius: 8px; display: grid; grid-template-columns: 1fr 1fr 1fr; text-align: center;">
+                    <div><small style="color:#64748b">LOTS</small><br><b>{max_lots}</b></div>
+                    <div><small style="color:#64748b">EXIT @</small><br><b style="color:#22c55e">{exit_price:.2f}</b></div>
+                    <div><small style="color:#64748b">PROFIT</small><br><b>₹{int(est_profit)}</b></div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 else:
-    st.info(f"Press Refresh to sync current strikes for {st.secrets['EXPIRY']}.")
+    st.info(f"Press Refresh to sync data for {st.secrets['EXPIRY']}.")
 
 st.caption("Data source: Upstox API v2 [MarketQuoteApi & OptionsApi]")
