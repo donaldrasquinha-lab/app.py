@@ -7,7 +7,7 @@ from upstox_client.rest import ApiException
 # 1. UI Configuration
 st.set_page_config(page_title="Options Alpha Live", layout="centered")
 
-# Custom CSS for Mobile UI
+# Custom CSS for Mobile-Friendly UI
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
@@ -25,7 +25,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 2. Login Logic
+# 2. Login Setup
 client_id = st.secrets["UPSTOX_CLIENT_ID"]
 redirect_uri = st.secrets["UPSTOX_REDIRECT_URI"]
 login_url = (
@@ -34,7 +34,7 @@ login_url = (
 )
 st.link_button("Login to Upstox", login_url)
 
-# 3. FIXED LIVE DATA FETCHING FUNCTION
+# 3. FIXED: Live Data Fetching
 def fetch_upstox_data():
     try:
         config = upstox_client.Configuration()
@@ -43,10 +43,10 @@ def fetch_upstox_data():
         api_client = upstox_client.ApiClient(config)
         options_api = upstox_client.OptionsApi(api_client)
         
+        # Pull parameters from secrets (Ensure expiry is YYYY-MM-DD)
         instrument = st.secrets.get("SYMBOL", "NSE_INDEX|Nifty 50")
-        expiry = st.secrets.get("EXPIRY", "2024-03-28") # Ensure YYYY-MM-DD format
+        expiry = st.secrets.get("EXPIRY", "2024-03-28") 
         
-        # API returns a list of strikes, each containing call/put nested objects
         response = options_api.get_put_call_option_chain(
             instrument_key=instrument, 
             expiry_date=expiry
@@ -54,18 +54,19 @@ def fetch_upstox_data():
         
         processed_signals = []
         if response and response.data:
-            for strike_data in response.data:
-                # Process Call Options (CE) and Put Options (PE) separately
-                for opt_type in ['call_options', 'put_options']:
-                    contract = getattr(strike_data, opt_type, None)
+            for strike_row in response.data:
+                # Process Call Options (CE) and Put Options (PE) if they exist
+                for opt_key in ['call_options', 'put_options']:
+                    opt_data = getattr(strike_row, opt_key, None)
                     
-                    if contract:
-                        greeks = getattr(contract, 'option_greeks', None)
-                        market = getattr(contract, 'market_data', None)
+                    if opt_data:
+                        # Extract nested values safely
+                        market = getattr(opt_data, 'market_data', None)
+                        greeks = getattr(opt_data, 'option_greeks', None)
                         
                         processed_signals.append({
-                            "type": "CE" if opt_type == 'call_options' else "PE",
-                            "strike": contract.trading_symbol,
+                            "type": "CE" if opt_key == 'call_options' else "PE",
+                            "strike": opt_data.trading_symbol, # FIXED: Accessing from sub-object
                             "ltp": market.ltp if market else 0.0,
                             "oi_chg": f"{market.oi_change_percentage:.1f}%" if market else "0.0%",
                             "gamma": f"{greeks.gamma:.4f}" if greeks else "0.00",
@@ -76,7 +77,7 @@ def fetch_upstox_data():
         st.error(f"Connection Error: {str(e)}")
         return []
 
-# 4. UI LAYOUT & EXECUTION
+# 4. UI Layout & Execution
 st.title("🎯 Options Momentum")
 
 col1, col2 = st.columns(2)
@@ -89,14 +90,16 @@ if st.button('🔄 Refresh Live Data'):
     signals = fetch_upstox_data()
     
     if not signals:
-        st.warning("No live data found. Check Expiry Date in Secrets.")
+        st.warning("No data returned. Verify the Expiry Date and API Token in Secrets.")
     else:
-        for s in signals[:8]:
+        # Display top 10 results
+        for s in signals[:10]:
             is_call = s['type'] == "CE"
             border_class = "card" if is_call else "card put-card"
             color = "#22c55e" if is_call else "#ef4444"
             
-            lot_size = 50  # Nifty Lot
+            # Simple position sizing logic
+            lot_size = 50 # Nifty Lot Size
             cost_per_lot = s['ltp'] * lot_size
             
             if cost_per_lot > 0:
@@ -108,7 +111,7 @@ if st.button('🔄 Refresh Live Data'):
                 <div class="{border_class}">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <h2 style="color: {color}; margin:0; font-size: 1.1rem;">{s['strike']}</h2>
-                        <span style="color: white; font-family: monospace;">₹{s['ltp']}</span>
+                        <span style="color: white; font-family: monospace; font-weight: bold;">₹{s['ltp']}</span>
                     </div>
                     <hr style="opacity: 0.1; margin: 10px 0;">
                     <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center;">
@@ -124,6 +127,6 @@ if st.button('🔄 Refresh Live Data'):
                 </div>
                 """, unsafe_allow_html=True)
 else:
-    st.info("Click 'Refresh' to fetch live Nifty strikes.")
+    st.info("Click 'Refresh' to fetch live option chain data.")
 
-st.caption("Powered by [Upstox API V2](https://upstox.com/developer/api-documentation/get-pc-option-chain/)")
+st.caption("Data source: [Upstox API v2](https://upstox.com/developer/api-documentation/get-pc-option-chain/)")
