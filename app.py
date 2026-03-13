@@ -4,29 +4,27 @@ import threading
 import time
 import pandas as pd
 
-# --- 1. FAILSAFE SECRETS CHECK ---
-# This prevents the "KeyError" crash and shows you instructions instead.
+# --- 1. INITIALIZE SESSION STATE & GLOBAL STORE ---
+# We use a simple global dict for the background thread to avoid "Missing Script Context" errors
+if "data_store" not in st.session_state:
+    st.session_state.data_store = {"ltp": 0.0, "time": "Connecting...", "error": None}
+
+# This global variable is accessible by the background thread
+LIVE_TICK = {"ltp": 0.0, "time": "Connecting...", "error": None}
+
+# --- 2. FAILSAFE SECRETS CHECK ---
 if "UPSTOX_ACCESS_TOKEN" not in st.secrets:
-    st.error("❌ **Secret Key 'UPSTOX_ACCESS_TOKEN' Not Found!**")
-    st.markdown("""
-    **How to fix this:**
-    1. Go to your [Streamlit Cloud Dashboard](https://share.streamlit.io).
-    2. Click the **three dots (⋮)** next to your app -> **Settings** -> **Secrets**.
-    3. Paste the following line (replace with your actual token):
-       `UPSTOX_ACCESS_TOKEN = "your_long_extended_token_here"`
-    4. Click **Save**.
-    """)
+    st.error("❌ Secret Key 'UPSTOX_ACCESS_TOKEN' Not Found in Settings!")
     st.stop()
 
-# --- 2. INITIALIZATION ---
 ACCESS_TOKEN = st.secrets["UPSTOX_ACCESS_TOKEN"]
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 api_client = upstox_client.ApiClient(configuration)
 
 # --- 3. UI SETUP ---
-st.set_page_config(page_title="Upstox Live Dashboard", layout="wide")
-st.title("📈 Upstox Real-Time Index Feed")
+st.set_page_config(page_title="Upstox Live Feed", layout="wide")
+st.title("📈 Upstox Real-Time Dashboard")
 
 INDEX_MAP = {
     "Nifty 50": "NSE_INDEX|Nifty 50",
@@ -34,70 +32,59 @@ INDEX_MAP = {
     "FinNifty": "NSE_INDEX|Nifty Fin Service",
     "SENSEX": "BSE_INDEX|SENSEX"
 }
+index_display = st.sidebar.selectbox("Select Index", list(INDEX_MAP.keys()))
+index_key = INDEX_MAP[index_display]
 
-index_display_name = st.sidebar.selectbox("Select Index", list(INDEX_MAP.keys()))
-index_key = INDEX_MAP[index_display_name]
-
-# Global storage for live data across app reruns
-if "live_feed" not in st.session_state:
-    st.session_state.live_feed = {"ltp": 0.0, "time": "Connecting...", "error": None}
-
-# --- 4. WEBSOCKET LOGIC (Upstox V3) ---
+# --- 4. WEBSOCKET LOGIC ---
 def on_message(message):
-    """Handles incoming market data ticks."""
     try:
         if "feeds" in message and index_key in message["feeds"]:
             data = message["feeds"][index_key]
             if "ltpc" in data:
-                st.session_state.live_feed["ltp"] = data["ltpc"]["ltp"]
-                st.session_state.live_feed["time"] = time.strftime("%H:%M:%S")
+                LIVE_TICK["ltp"] = data["ltpc"]["ltp"]
+                LIVE_TICK["time"] = time.strftime("%H:%M:%S")
     except Exception as e:
-        st.session_state.live_feed["error"] = str(e)
+        LIVE_TICK["error"] = str(e)
 
 def start_upstox_stream():
-    """Initializes the background WebSocket streamer."""
     try:
-        # MarketDataStreamerV3 handles binary/protobuf decoding automatically
         streamer = upstox_client.MarketDataStreamerV3(api_client)
         streamer.on("message", on_message)
         streamer.connect()
         streamer.subscribe([index_key], "ltpc")
     except Exception as e:
-        st.session_state.live_feed["error"] = f"Streamer Error: {e}"
+        LIVE_TICK["error"] = f"Connection Failed: {e}"
 
-# Start thread if not already active
-if "thread_active" not in st.session_state:
-    threading.Thread(target=start_upstox_stream, daemon=True).start()
-    st.session_state.thread_active = True
+# Start thread only once
+if "ws_active" not in st.session_state:
+    t = threading.Thread(target=start_upstox_stream, daemon=True)
+    t.start()
+    st.session_state.ws_active = True
 
-# --- 5. DATA DISPLAY ---
-if st.session_state.live_feed["error"]:
-    st.error(f"Connection Error: {st.session_state.live_feed['error']}")
+# --- 5. SYNC GLOBAL DATA TO SESSION STATE ---
+st.session_state.data_store.update(LIVE_TICK)
 
-ltp = st.session_state.live_feed["ltp"]
-col1, col2 = st.columns([1, 2])
+# --- 6. DISPLAY ---
+if st.session_state.data_store["error"]:
+    st.error(f"⚠️ {st.session_state.data_store['error']}")
+    st.info("Check if your token is expired or if you have too many tabs open.")
+
+ltp = st.session_state.data_store["ltp"]
+col1, col2 = st.columns(2)
 
 with col1:
-    st.metric(label=f"{index_display_name} Spot", value=f"₹{ltp:,.2f}")
-    st.caption(f"Last updated: {st.session_state.live_feed['time']}")
+    st.metric(label=f"{index_display} Spot", value=f"₹{ltp:,.2f}")
+    st.caption(f"Last updated: {st.session_state.data_store['time']}")
 
 with col2:
     if ltp > 0:
-        st.subheader("Simulated 10-Strike Option Chain")
-        # Interval: Nifty/Fin=50, Bank/Sensex=100
-        interval = 100 if "Bank" in index_display_name or "SENSEX" in index_display_name else 50
-        atm_strike = round(ltp / interval) * interval
-        
-        # Build 10-strike list (5 ITM, 5 OTM)
-        strikes = [atm_strike + (i * interval) for i in range(-5, 5)]
-        df = pd.DataFrame([
-            {"Strike Price": s, "Type": "CE/PE", "Moneyness": "ITM" if s < ltp else "OTM"} 
-            for s in strikes
-        ])
+        interval = 100 if "Bank" in index_display or "SENSEX" in index_display else 50
+        atm = round(ltp / interval) * interval
+        strikes = [atm + (i * interval) for i in range(-5, 5)]
+        df = pd.DataFrame([{"Strike": s, "Pos": "ITM" if s < ltp else "OTM"} for s in strikes])
         st.table(df)
     else:
-        st.info("🕒 Waiting for market data... (Market must be open: 9:15 AM - 3:30 PM IST)")
+        st.warning("Waiting for data... Ensure market is open (9:15 AM - 3:30 PM).")
 
-# Auto-refresh UI every 1 second
 time.sleep(1)
 st.rerun()
