@@ -1,26 +1,23 @@
 import streamlit as st
 import pandas as pd
 import upstox_client
+from datetime import datetime
 
-# --- DATA FETCHING LOGIC ---
-def get_live_data(index_key, expiry="2024-05-30"):
-    """
-    Fetches real data based on selected index. 
-    Note: Upstox instrument keys follow 'NSE_INDEX|Index Name' format.
-    """
+# --- CONFIGURATION & API ---
+st.set_page_config(page_title="Options Alpha", layout="centered")
+
+def get_live_data(index_key, expiry):
     try:
         config = upstox_client.Configuration()
         config.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
         api = upstox_client.OptionsApi(upstox_client.ApiClient(config))
-        # Use the dynamic index_key from the dropdown
+        # Fetching the live chain for the selected index and expiry
         return api.get_put_call_option_chain(instrument_key=index_key, expiry_date=expiry)
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"Upstox API Error: {e}")
         return None
 
-# --- UI CONFIGURATION ---
-st.set_page_config(page_title="Options Alpha", layout="centered")
-
+# --- CUSTOM UI STYLES ---
 st.markdown("""
     <style>
     .main { background-color: #0e1117; }
@@ -38,55 +35,65 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- HEADER & CONTROLS ---
 st.title("🎯 Options Momentum")
 
-# Index Dropdown and Refresh Button in one row
-ctrl_col1, ctrl_col2 = st.columns([3, 1])
+# --- CONTROLS ---
+ctrl_col1, ctrl_col2 = st.columns([2, 1])
 with ctrl_col1:
-    index_choice = st.selectbox(
-        "Select Index", 
-        options=["Nifty 50", "Nifty Bank", "Nifty Fin Service"], 
-        index=0
-    )
-    # Format for Upstox API
-    selected_key = f"NSE_INDEX|{index_choice}"
-
+    index_name = st.selectbox("Index", ["Nifty 50", "Nifty Bank", "FINNIFTY"])
+    selected_key = f"NSE_INDEX|{index_name}"
 with ctrl_col2:
-    st.write(" ") # Padding
-    refresh = st.button("🔄 Refresh")
+    # Example expiry - in production, fetch this dynamically via get_expiry
+    expiry_date = st.text_input("Expiry (YYYY-MM-DD)", "2024-05-30")
 
-# --- INPUT SECTION ---
 col1, col2 = st.columns(2)
 with col1:
     capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
 with col2:
     target_pct = st.number_input("Target Return %", value=20, step=5)
 
-# --- SIGNAL PROCESSING ---
-# This part replaces your static 'signals' list with real data if available
-# For now, it stays as your working mock logic unless you uncomment the API call
-signals = [
-    {"type": "CALL", "strike": f"{index_choice} 22500 CE", "ltp": 142.0, "oi_chg": "+24%", "gamma": "High", "iv": 14.2},
-    {"type": "PUT", "strike": f"{index_choice} 22300 PE", "ltp": 88.5, "oi_chg": "+18%", "gamma": "Med", "iv": 18.5}
-]
+# --- LIVE DATA PROCESSING ---
+lot_sizes = {"Nifty 50": 50, "Nifty Bank": 15, "FINNIFTY": 40}
+current_lot_size = lot_sizes.get(index_name, 50)
 
-# Example of how to trigger the real API call on refresh or index change:
-# if refresh or index_choice:
-#     data = get_live_data(selected_key)
-#     # (Add logic here to map 'data' to your 'signals' list)
+# Fetch data and filter for ATM (At-the-money) contracts
+api_resp = get_live_data(selected_key, expiry_date)
+processed_signals = []
 
-# --- LIVE SIGNAL CARDS ---
-for s in signals:
+if api_resp and api_resp.data:
+    # Sort by proximity to spot price to find ATM
+    for item in api_resp.data:
+        # Check if call/put data exists in the response
+        if item.call_options:
+            processed_signals.append({
+                "type": "CALL",
+                "strike": f"{index_name} {item.strike_price} CE",
+                "ltp": item.call_options.market_data.ltp,
+                "oi_chg": f"{item.call_options.market_data.oi_change_pct:.1f}%",
+                "iv": round(item.call_options.market_data.iv, 2),
+                "gamma": "N/A" # Greeks often require separate MarketQuoteV3Api call
+            })
+        if item.put_options:
+            processed_signals.append({
+                "type": "PUT",
+                "strike": f"{index_name} {item.strike_price} PE",
+                "ltp": item.put_options.market_data.ltp,
+                "oi_chg": f"{item.put_options.market_data.oi_change_pct:.1f}%",
+                "iv": round(item.put_options.market_data.iv, 2),
+                "gamma": "N/A"
+            })
+
+# --- UI RENDERING ---
+# Display top 2 momentum signals (e.g., highest OI change)
+for s in processed_signals[:4]: # Showing top 4 for variety
     border_class = "card" if s['type'] == "CALL" else "card put-card"
     color = "#22c55e" if s['type'] == "CALL" else "#ef4444"
     
-    # Calculations
-    lot_size = 50 # Nifty is 50, but BankNifty is 15. You may want to adjust this based on index.
-    cost_per_lot = s['ltp'] * lot_size
-    max_lots = int(capital // cost_per_lot)
+    # Real-time calculations
+    cost_per_lot = s['ltp'] * current_lot_size
+    max_lots = int(capital // cost_per_lot) if cost_per_lot > 0 else 0
     exit_price = s['ltp'] * (1 + (target_pct / 100))
-    est_profit = (exit_price - s['ltp']) * (max_lots * lot_size)
+    est_profit = (exit_price - s['ltp']) * (max_lots * current_lot_size)
 
     st.markdown(f"""
     <div class="{border_class}">
@@ -108,4 +115,4 @@ for s in signals:
     </div>
     """, unsafe_allow_html=True)
 
-st.caption(f"Index: {index_choice} | Data source: Upstox API V3")
+st.caption(f"Last Sync: {datetime.now().strftime('%H:%M:%S')} | Data: Upstox API V3")
