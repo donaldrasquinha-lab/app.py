@@ -1,53 +1,76 @@
 import streamlit as st
-from nsepython import *
+from nselib import market_data
 import pandas as pd
 import time
 
-# --- UI SETUP ---
-st.set_page_config(page_title="NSE Live Dashboard", layout="wide")
-st.title("🇮🇳 NSE India Live Market Data")
+# --- Page Config ---
+st.set_page_config(page_title="NSE Live Tracker", layout="wide")
+st.title("🇮🇳 NSE Live Index Dashboard")
 
-# Index selection
+# --- Sidebar Selection ---
 index_map = {
     "Nifty 50": "NIFTY 50",
     "Bank Nifty": "NIFTY BANK",
     "FinNifty": "NIFTY FIN SERVICE"
 }
-selected_index = st.sidebar.selectbox("Select Index", list(index_map.keys()))
+selected_label = st.sidebar.selectbox("Select Index", list(index_map.keys()))
+selected_symbol = index_map[selected_label]
 
-# --- DATA FETCHING ---
-def get_live_data():
+# --- Data Fetching Function ---
+def get_nse_data(symbol):
     try:
-        # Fetching index quote
-        index_data = nse_get_index_quote(index_map[selected_index])
-        return index_data
+        # Fetch index data as a Pandas DataFrame
+        df = market_data.get_indices_reading()
+        # Filter for the selected index
+        row = df[df['index'] == symbol]
+        if not row.empty:
+            return row.iloc[0].to_dict()
+        return None
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.error(f"NSE Connection Error: {e}")
         return None
 
-# Display data
-data = get_live_data()
+# --- Main Logic ---
+data = get_nse_data(selected_symbol)
 
 if data:
-    # Display Key Metrics
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Last Price", f"₹{data['last']}")
-    col2.metric("Change", f"{data['variation']} ({data['percentChange']}%)")
-    col3.metric("Open", f"₹{data['open']}")
-
-    # Simulated Option Chain / Strike Prices
-    st.subheader(f"Strikes around {selected_index}")
-    spot = float(data['last'])
-    interval = 100 if "Bank" in selected_index else 50
-    atm = round(spot / interval) * interval
+    # Extract data using the exact keys from nselib/NSE
+    # Typical keys: 'last', 'variation', 'percentChange', 'open', 'high', 'low'
+    ltp = data.get('last', 0)
+    change = data.get('variation', 0)
+    p_change = data.get('percentChange', 0)
     
-    strikes = [atm + (i * interval) for i in range(-5, 6)]
-    strike_df = pd.DataFrame({
-        "Strike Price": strikes,
-        "Moneyness": ["ITM" if s < spot else "OTM" for s in strikes]
-    })
-    st.table(strike_df)
+    # --- Display Metrics ---
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Last Price", f"₹{ltp:,.2f}")
+    col2.metric("Change", f"{change} ({p_change}%)", delta=float(change))
+    col3.metric("Open", f"₹{data.get('open', 0):,.2f}")
 
-# Auto-refresh UI every 30 seconds (NSE limits frequent requests)
+    # --- Simulated Option Chain ---
+    st.subheader(f"Strikes for {selected_label}")
+    try:
+        spot = float(ltp)
+        interval = 100 if "Bank" in selected_label else 50
+        atm = round(spot / interval) * interval
+        
+        # Generate 5 ITM and 5 OTM strikes
+        strikes = [atm + (i * interval) for i in range(-5, 6)]
+        strike_df = pd.DataFrame({
+            "Strike Price": strikes,
+            "Moneyness": ["ITM" if s < spot else "OTM" for s in strikes],
+            "Distance": [f"{abs(s - spot):.2f}" for s in strikes]
+        })
+        st.table(strike_df)
+    except:
+        st.warning("Could not calculate strikes. Check if LTP is valid.")
+
+    st.info(f"Last fetched at: {time.strftime('%H:%M:%S')}. Auto-refreshing in 30s...")
+else:
+    st.warning("No data received. NSE might be blocking the request or the market is closed.")
+    if st.button("Retry Now"):
+        st.rerun()
+
+# --- Auto Refresh ---
+# Do not set below 30s or NSE will block your Streamlit Cloud IP
 time.sleep(30)
 st.rerun()
