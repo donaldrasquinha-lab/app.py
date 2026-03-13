@@ -1,5 +1,4 @@
 upstox-python-sdk
 nsepython
-nselib
 streamlit
 pandas
