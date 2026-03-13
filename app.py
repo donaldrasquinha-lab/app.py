@@ -30,9 +30,9 @@ login_url = (
     f"https://api.upstox.com?"
     f"client_id={client_id}&redirect_uri={urllib.parse.quote(redirect_uri)}"
 )
-st.link_button("Login to Upstox", login_url)
+st.link_button("🔑 Login to Upstox", login_url)
 
-# 3. FIXED: Live Data Fetching Function
+# 3. ROBUST: Live Data Fetching Function
 def fetch_upstox_data():
     try:
         config = upstox_client.Configuration()
@@ -41,7 +41,7 @@ def fetch_upstox_data():
         api_client = upstox_client.ApiClient(config)
         options_api = upstox_client.OptionsApi(api_client)
         
-        # Pull parameters from your secrets
+        # API parameters from your secrets
         instrument = st.secrets["SYMBOL"]
         expiry = st.secrets["EXPIRY"]
         
@@ -51,54 +51,51 @@ def fetch_upstox_data():
         )
         
         processed_signals = []
-        if response and response.data:
-            # Each 'strike_row' is a PutCallOptionChainData object
+        # Upstox SDK v2 wraps data in response.data
+        if response and hasattr(response, 'data') and response.data:
             for strike_row in response.data:
-                
-                # Check for Call Options (CE) and Put Options (PE) in the row
+                # Process Call Options (CE) and Put Options (PE)
                 for side in ['call_options', 'put_options']:
                     opt_data = getattr(strike_row, side, None)
                     
                     if opt_data:
-                        # Extract nested values safely using getattr
+                        # FIX: Check for trading_symbol OR instrument_key inside the option object
+                        symbol = getattr(opt_data, 'trading_symbol', getattr(opt_data, 'instrument_key', "N/A"))
                         market = getattr(opt_data, 'market_data', None)
                         greeks = getattr(opt_data, 'option_greeks', None)
                         
                         processed_signals.append({
                             "type": "CE" if side == 'call_options' else "PE",
-                            "strike": opt_data.trading_symbol, # FIX: Symbol is inside the option object
-                            "ltp": market.ltp if market else 0.0,
-                            "oi_chg": f"{market.oi_change_percentage:.1f}%" if market else "0.0%",
-                            "gamma": f"{greeks.gamma:.4f}" if greeks else "0.00",
-                            "iv": round(greeks.iv, 2) if greeks else 0.0
+                            "strike": symbol,
+                            "ltp": getattr(market, 'ltp', 0.0) if market else 0.0,
+                            "oi_chg": f"{getattr(market, 'oi_change_percentage', 0.0):.1f}%",
+                            "gamma": f"{getattr(greeks, 'gamma', 0.0):.4f}",
+                            "iv": round(getattr(greeks, 'iv', 0.0), 2)
                         })
         return processed_signals
     except Exception as e:
-        st.error(f"Connection Error: {str(e)}")
+        st.error(f"⚠️ Connection Error: {str(e)}")
         return []
 
 # 4. UI Layout & Execution
 st.title("🎯 Options Momentum")
 
-col1, col2 = st.columns(2)
-with col1:
-    capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
-with col2:
-    target_pct = st.number_input("Target Return %", value=20, step=5)
+capital = st.number_input("Trading Capital (₹)", value=50000, step=5000)
+target_pct = st.number_input("Target Return %", value=20, step=5)
 
 if st.button('🔄 Refresh Live Data'):
     signals = fetch_upstox_data()
     
     if not signals:
-        st.warning(f"No live data found for {st.secrets['EXPIRY']}. Please check your Token or Expiry date.")
+        st.warning(f"No live data found for {st.secrets['EXPIRY']}. Check if your Token is expired (Access Tokens typically last 24 hours).")
     else:
-        # Sort or filter if needed, here we show the first 12 results (CE and PE)
+        # Show top results (CE and PE)
         for s in signals[:12]:
             is_call = s['type'] == "CE"
             border_class = "card" if is_call else "card put-card"
             color = "#22c55e" if is_call else "#ef4444"
             
-            # Position & Exit Calculations (Nifty Lot Size = 75)
+            # Position & Exit Calculations (Nifty Lot Size is currently 75)
             lot_size = 75  
             cost_per_lot = s['ltp'] * lot_size
             
@@ -110,7 +107,7 @@ if st.button('🔄 Refresh Live Data'):
                 st.markdown(f"""
                 <div class="{border_class}">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <h2 style="color: {color}; margin:0; font-size: 1.1rem;">{s['strike']}</h2>
+                        <h2 style="color: {color}; margin:0; font-size: 1rem;">{s['strike']}</h2>
                         <span style="color: white; font-family: monospace; font-weight: bold;">₹{s['ltp']}</span>
                     </div>
                     <hr style="opacity: 0.1; margin: 10px 0;">
@@ -129,4 +126,4 @@ if st.button('🔄 Refresh Live Data'):
 else:
     st.info(f"Currently monitoring {st.secrets['SYMBOL']} for {st.secrets['EXPIRY']}.")
 
-st.caption("Powered by Upstox API V2")
+st.caption("Data source: [Upstox API v2](https://upstox.com/developer/api-documentation/get-pc-option-chain/)")
