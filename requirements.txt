@@ -1,4 +1,4 @@
 upstox-python-sdk
-pip install streamlit-autorefresh
+streamlit-autorefresh
 streamlit
 pandas
