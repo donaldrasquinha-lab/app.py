@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 # --- 1. PAGE SETUP ---
 st.set_page_config(page_title="Options Momentum Pro", layout="centered")
 
-# Custom CSS for Mobile Glassmorphism UI
+# Custom CSS for Mobile UI
 st.markdown("""
     <style>
     .main { background-color: #0e1117; color: white; }
@@ -26,10 +26,8 @@ st.markdown("""
 
 # --- 2. DYNAMIC EXPIRY CALCULATION ---
 def get_current_expiry():
-    """Finds the upcoming Thursday for Nifty expiry."""
     today = datetime.now()
     days_until_thursday = (3 - today.weekday() + 7) % 7
-    # If today is Thursday after market hours (3:30 PM), move to next week
     if days_until_thursday == 0 and today.hour >= 15 and today.minute >= 30:
         days_until_thursday = 7
     target_date = today + timedelta(days=days_until_thursday)
@@ -38,7 +36,7 @@ def get_current_expiry():
 # --- 3. LIVE DATA FETCHING ---
 def get_live_data():
     if "UPSTOX_EXTENDED_TOKEN" not in st.secrets:
-        st.error("Missing 'UPSTOX_EXTENDED_TOKEN' in Streamlit Secrets!")
+        st.error("Missing 'UPSTOX_EXTENDED_TOKEN' in Secrets!")
         return []
 
     config = upstox_client.Configuration()
@@ -50,22 +48,24 @@ def get_live_data():
         instrument = st.secrets.get("SYMBOL", "NSE_INDEX|Nifty 50")
         expiry = st.secrets.get("EXPIRY", get_current_expiry())
         
-        # Upstox API v3 call
         response = api_instance.get_put_call_option_chain(instrument, expiry)
         
         live_list = []
         if response and response.data:
             for item in response.data:
-                # Handling separate call/put objects in the response
+                # Upstox v3 separates Call and Put options under each strike price
                 for side in ['call_options', 'put_options']:
                     opt = getattr(item, side, None)
                     if opt:
+                        # Extracting nested attributes: market_data and option_greeks
+                        market_data = getattr(opt, 'market_data', None)
                         greeks = getattr(opt, 'option_greeks', None)
+                        
                         live_list.append({
                             "type": "CE" if side == 'call_options' else "PE",
-                            "strike": opt.trading_symbol,
-                            "ltp": getattr(opt, 'market_data', {}).last_price if hasattr(opt, 'market_data') else 0.0,
-                            "oi": getattr(opt, 'market_data', {}).oi if hasattr(opt, 'market_data') else 0.0,
+                            "strike": opt.trading_symbol, # Now accessed via the nested opt object
+                            "ltp": market_data.last_price if market_data else 0.0,
+                            "oi": market_data.oi if market_data else 0.0,
                             "gamma": f"{greeks.gamma:.4f}" if greeks else "0.00",
                             "iv": round(greeks.iv, 2) if greeks else 0.0
                         })
@@ -95,7 +95,6 @@ if st.button('🔄 Refresh Real-Time Data'):
             card_style = "card" if is_ce else "card put-card"
             accent_color = "#22c55e" if is_ce else "#ef4444"
             
-            # Position Math
             lot_size = 50
             cost = s['ltp'] * lot_size
             if cost > 0:
