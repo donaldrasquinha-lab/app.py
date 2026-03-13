@@ -4,15 +4,33 @@ import threading
 import time
 import pandas as pd
 
-# --- INITIALIZATION ---
+# --- 1. SAFE SECRETS LOADING ---
+# This block prevents the KeyError and tells you exactly what to do.
+if "UPSTOX_ACCESS_TOKEN" not in st.secrets:
+    st.error("❌ **Secret Key Missing!**")
+    st.info("""
+    Please follow these steps:
+    1. Go to your **Streamlit Cloud Dashboard**.
+    2. Click **Manage App** -> **Settings** -> **Secrets**.
+    3. Paste your credentials exactly like this:
+    ```toml
+    UPSTOX_ACCESS_TOKEN = "your_extended_token_here"
+    ```
+    4. Click **Save** and the app will restart.
+    """)
+    st.stop()
+
+# Load credentials from Streamlit Secrets
 ACCESS_TOKEN = st.secrets["UPSTOX_ACCESS_TOKEN"]
+
+# Initialize Upstox API Client
 configuration = upstox_client.Configuration()
 configuration.access_token = ACCESS_TOKEN
 api_client = upstox_client.ApiClient(configuration)
 
-# --- UI SETUP ---
+# --- 2. UI SETUP ---
 st.set_page_config(page_title="Upstox Live Feed", layout="wide")
-st.title("📊 Upstox Real-Time Index & Options")
+st.title("📈 Upstox Real-Time Index & Options")
 
 # Index mapping with correct instrument keys
 INDEX_MAP = {
@@ -25,13 +43,14 @@ INDEX_MAP = {
 index_display_name = st.sidebar.selectbox("Select Index", list(INDEX_MAP.keys()))
 index_key = INDEX_MAP[index_display_name]
 
-# Persistent storage for live data
+# Persistent storage for live data across reruns
 if "data_store" not in st.session_state:
     st.session_state.data_store = {"ltp": 0.0, "time": "Connecting..."}
 
-# --- WEBSOCKET HANDLERS ---
+# --- 3. WEBSOCKET LOGIC ---
 def on_message(message):
     """Callback for tick data from WebSocket V3."""
+    # V3 returns data in a 'feeds' dictionary
     if "feeds" in message and index_key in message["feeds"]:
         feed = message["feeds"][index_key]
         if "ltpc" in feed:
@@ -39,19 +58,21 @@ def on_message(message):
             st.session_state.data_store["time"] = time.strftime("%H:%M:%S")
 
 def start_stream():
-    """Initializes the V3 Streamer."""
-    # MarketDataStreamerV3 handles decoding internally
-    streamer = upstox_client.MarketDataStreamerV3(api_client)
-    streamer.on("message", on_message)
-    streamer.connect()
-    streamer.subscribe([index_key], "ltpc") # LTPC mode for tick updates
+    """Initializes and runs the Upstox MarketDataStreamerV3."""
+    try:
+        streamer = upstox_client.MarketDataStreamerV3(api_client)
+        streamer.on("message", on_message)
+        streamer.connect()
+        streamer.subscribe([index_key], "ltpc")
+    except Exception as e:
+        print(f"WebSocket Error: {e}")
 
-# Start background thread
+# Start the background thread once per session
 if "thread_active" not in st.session_state:
     threading.Thread(target=start_stream, daemon=True).start()
     st.session_state.thread_active = True
 
-# --- DATA DISPLAY ---
+# --- 4. DATA DISPLAY ---
 spot = st.session_state.data_store["ltp"]
 col1, col2 = st.columns([1, 2])
 
@@ -61,24 +82,27 @@ with col1:
 
 with col2:
     if spot > 0:
-        st.subheader("Simulated 10-Strike Option Chain")
+        st.subheader("Live Option Chain (Approximate Strikes)")
         
-        # Determine interval (50 for Nifty/FinNifty, 100 for Bank/SENSEX)
+        # Determine strike interval (50 for Nifty/FinNifty, 100 for Bank/SENSEX)
         interval = 100 if "Bank" in index_display_name or "SENSEX" in index_display_name else 50
         atm_strike = round(spot / interval) * interval
         
-        # Build chain (5 ITM and 5 OTM)
+        # Build 10-strike list (5 ITM and 5 OTM)
         strikes = [atm_strike + (i * interval) for i in range(-5, 5)]
-        chain = []
+        chain_list = []
         for s in strikes:
-            chain.append({
+            chain_list.append({
                 "Strike Price": s,
-                "Position": "ITM" if (s < spot) else "OTM",
+                "Moneyness": "ITM" if (s < spot) else "OTM",
                 "Distance": f"{abs(s - spot):.2f} pts"
             })
         
-        st.table(pd.DataFrame(chain))
+        st.table(pd.DataFrame(chain_list))
+    else:
+        st.warning("Waiting for data from Upstox... Ensure your token is valid and the market is open.")
 
 # Auto-refresh UI every 1 second
 time.sleep(1)
 st.rerun()
+
