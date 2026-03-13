@@ -4,24 +4,21 @@ import threading
 import time
 import pandas as pd
 
-# --- 1. GLOBAL DATA BRIDGE ---
-# Threads cannot safely write to st.session_state directly.
-# We use a global dictionary to hold the latest tick data.
-SHARED_DATA = {"ltp": 0.0, "time": "Waiting...", "error": None}
-
-# --- 2. SECRETS & AUTHENTICATION ---
+# --- 1. ACCESS SECRETS FROM TOML ---
+# st.secrets automatically reads from .streamlit/secrets.toml
 if "UPSTOX_ACCESS_TOKEN" not in st.secrets:
-    st.error("❌ 'UPSTOX_ACCESS_TOKEN' missing in Streamlit Secrets!")
+    st.error("❌ Token not found! Ensure .streamlit/secrets.toml is configured.")
     st.stop()
 
-def get_api_client():
-    conf = upstox_client.Configuration()
-    conf.access_token = st.secrets["UPSTOX_ACCESS_TOKEN"]
-    return upstox_client.ApiClient(conf)
+ACCESS_TOKEN = st.secrets["UPSTOX_ACCESS_TOKEN"]
 
-# --- 3. UI LAYOUT ---
-st.set_page_config(page_title="Upstox V3 Live", layout="wide")
-st.title("🚀 Upstox Market Data V3 Live Feed")
+# --- 2. GLOBAL DATA STORE ---
+# Shared dictionary to pass data from background thread to UI
+SHARED_DATA = {"ltp": 0.0, "time": "Waiting...", "error": None}
+
+# --- 3. UI SETUP ---
+st.set_page_config(page_title="Upstox TOML Dashboard", layout="wide")
+st.title("📈 Upstox Live Feed (Connected via TOML)")
 
 INDEX_MAP = {
     "Nifty 50": "NSE_INDEX|Nifty 50",
@@ -29,36 +26,32 @@ INDEX_MAP = {
     "FinNifty": "NSE_INDEX|Nifty Fin Service",
     "SENSEX": "BSE_INDEX|SENSEX"
 }
-
 index_name = st.sidebar.selectbox("Select Index", list(INDEX_MAP.keys()))
 index_key = INDEX_MAP[index_name]
 
-# --- 4. WEBSOCKET LOGIC (ALIGNED WITH V3 DOCS) ---
+# --- 4. WEBSOCKET LOGIC (V3) ---
 def on_message(message):
-    """Callback for V3 Protobuf decoded messages."""
-    try:
-        # V3 Feed structure: message['feeds'][key]['ltpc']['ltp']
-        if "feeds" in message and index_key in message["feeds"]:
-            feed = message["feeds"][index_key]
-            if "ltpc" in feed:
-                SHARED_DATA["ltp"] = feed["ltpc"]["ltp"]
-                SHARED_DATA["time"] = time.strftime("%H:%M:%S")
-    except Exception as e:
-        SHARED_DATA["error"] = f"Processing Error: {e}"
+    """Decodes live ticks from the Upstox V3 stream."""
+    if "feeds" in message and index_key in message["feeds"]:
+        feed = message["feeds"][index_key]
+        if "ltpc" in feed:
+            SHARED_DATA["ltp"] = feed["ltpc"]["ltp"]
+            SHARED_DATA["time"] = time.strftime("%H:%M:%S")
 
-def run_v3_streamer():
-    """Background task to maintain V3 WebSocket connection."""
+def start_v3_streamer():
+    """Initializes connection using credentials from TOML."""
     try:
-        api_client = get_api_client()
-        # MarketDataStreamerV3 handles binary protocol & redirection automatically
+        conf = upstox_client.Configuration()
+        conf.access_token = ACCESS_TOKEN
+        api_client = upstox_client.ApiClient(conf)
+        
+        # StreamerV3 handles binary Protobuf decoding automatically
         streamer = upstox_client.MarketDataStreamerV3(api_client)
         streamer.on("message", on_message)
         streamer.connect()
-        
-        # 'ltpc' mode = LTP, LTT, LTQ, and Close Price
         streamer.subscribe([index_key], "ltpc")
         
-        # Keep thread alive and handle dropdown changes
+        # Monitor for dropdown changes
         current_key = index_key
         while True:
             if current_key != index_key:
@@ -67,46 +60,31 @@ def run_v3_streamer():
                 current_key = index_key
             time.sleep(1)
     except Exception as e:
-        SHARED_DATA["error"] = f"V3 Connection Failed: {e}"
+        SHARED_DATA["error"] = f"Connection Failed: {e}"
 
-# Start the background thread once per app session
+# Start background thread once
 if "ws_active" not in st.session_state:
-    threading.Thread(target=run_v3_streamer, daemon=True).start()
+    threading.Thread(target=start_v3_streamer, daemon=True).start()
     st.session_state.ws_active = True
 
-# --- 5. DATA DISPLAY & REFRESH ---
-# Sync global thread data to local session display
+# --- 5. DISPLAY ---
 if SHARED_DATA["error"]:
     st.error(SHARED_DATA["error"])
 
 ltp = SHARED_DATA["ltp"]
-
-col1, col2 = st.columns([1, 2])
+col1, col2 = st.columns(2)
 
 with col1:
-    st.metric(
-        label=f"Live {index_name} Spot", 
-        value=f"₹{ltp:,.2f}" if ltp > 0 else "Fetching..."
-    )
-    st.caption(f"Last Tick Received: {SHARED_DATA['time']}")
+    st.metric(label=f"Live {index_name} Spot", value=f"₹{ltp:,.2f}" if ltp > 0 else "Fetching...")
+    st.caption(f"Last update: {SHARED_DATA['time']}")
 
 with col2:
     if ltp > 0:
-        st.subheader("Simulated 10-Strike Option Chain")
-        # Interval logic: Nifty/Fin=50, Bank/Sensex=100
+        st.subheader("10-Strike Option Chain")
         interval = 100 if "Bank" in index_name or "SENSEX" in index_name else 50
         atm = round(ltp / interval) * interval
-        
-        # Generate 5 ITM and 5 OTM strikes
         strikes = [atm + (i * interval) for i in range(-5, 5)]
-        df = pd.DataFrame([
-            {"Strike": s, "Position": "ITM" if s < ltp else "OTM"} 
-            for s in strikes
-        ])
-        st.table(df)
-    else:
-        st.info("🕒 Waiting for data... Ensure it's market hours (9:15 AM - 3:30 PM IST).")
+        st.table(pd.DataFrame([{"Strike": s, "Moneyness": "ITM" if s < ltp else "OTM"} for s in strikes]))
 
-# Force UI to rerun every 1 second to show live updates
 time.sleep(1)
 st.rerun()
