@@ -52,6 +52,15 @@ def safe_get_instrument(data_dict, key):
     return data_dict.get(key) or data_dict.get(alt_key)
 
 
+def _safe_float(obj, *attrs):
+    """Safely drill into nested attributes, return float or None."""
+    for attr in attrs:
+        if obj is None: return None
+        obj = getattr(obj, attr, None)
+    try: return float(obj) if obj is not None else None
+    except: return None
+
+
 def get_market_data(index_key):
     """
     Market hours  → live fetch, update cache.
@@ -69,16 +78,22 @@ def get_market_data(index_key):
         ohlc_resp = api.get_market_quote_ohlc(instrument_key=index_key, interval="1d")
 
         spot_obj  = safe_get_instrument(ltp_resp.data, index_key)
-        spot      = spot_obj.last_price if spot_obj else 0.0
+        spot      = _safe_float(spot_obj, 'last_price') or 0.0
 
         ohlc_obj  = safe_get_instrument(ohlc_resp.data, index_key)
         vwap_val, day_high, day_low = spot, spot, spot
 
-        if ohlc_obj and hasattr(ohlc_obj, 'ohlc'):
-            prices   = ohlc_obj.ohlc
-            vwap_val = (prices.high + prices.low + prices.close * 2) / 4
-            day_high = prices.high
-            day_low  = prices.low
+        # Upstox OHLC structure: ohlc_obj.ohlc.open / .high / .low / .close
+        # Also handle alternate attribute names gracefully
+        prices = getattr(ohlc_obj, 'ohlc', None) if ohlc_obj else None
+        if prices:
+            h = _safe_float(prices, 'high')
+            l = _safe_float(prices, 'low')
+            c = _safe_float(prices, 'close')
+            if h and l and c:
+                vwap_val = (h + l + c * 2) / 4
+                day_high = h
+                day_low  = l
 
         # Always overwrite cache with freshest live values
         st.session_state.last_cache[index_key] = {
@@ -236,14 +251,18 @@ if expiry_list and spot_price > 0:
         far_expiry  = expiry_list[min(3, len(expiry_list) - 1)]
         far_chain   = fetch_option_chain(selected_key, far_expiry) if far_expiry != near_expiry else []
 
-        # ── 1. Aggregate OI ──
+        # ── 1. Aggregate OI  (safe access — market_data or oi may be None) ──
+        def _oi(opt):
+            try: return float(opt.market_data.oi or 0)
+            except: return 0.0
+
         far_ce_oi, far_pe_oi = 0, 0
         for item in near_chain:
-            if item.call_options: total_ce_oi += item.call_options.market_data.oi
-            if item.put_options:  total_pe_oi += item.put_options.market_data.oi
+            if item.call_options: total_ce_oi += _oi(item.call_options)
+            if item.put_options:  total_pe_oi += _oi(item.put_options)
         for item in far_chain:
-            if item.call_options: far_ce_oi += item.call_options.market_data.oi
-            if item.put_options:  far_pe_oi += item.put_options.market_data.oi
+            if item.call_options: far_ce_oi += _oi(item.call_options)
+            if item.put_options:  far_pe_oi += _oi(item.put_options)
 
         pcr_near = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
         pcr_far  = far_pe_oi   / far_ce_oi   if far_ce_oi   > 0 else 0
@@ -262,12 +281,12 @@ if expiry_list and spot_price > 0:
         st.session_state.prev_trend = trend_status
 
         # ── 3. Support & Resistance from Max OI strikes ──
-        valid_ce = [i for i in near_chain if i.call_options and i.call_options.market_data.oi > 0]
-        valid_pe = [i for i in near_chain if i.put_options  and i.put_options.market_data.oi  > 0]
+        valid_ce = [i for i in near_chain if i.call_options and _oi(i.call_options) > 0]
+        valid_pe = [i for i in near_chain if i.put_options  and _oi(i.put_options)  > 0]
         if valid_ce:
-            resistance_strike = max(valid_ce, key=lambda x: x.call_options.market_data.oi).strike_price
+            resistance_strike = max(valid_ce, key=lambda x: _oi(x.call_options)).strike_price
         if valid_pe:
-            support_strike    = max(valid_pe, key=lambda x: x.put_options.market_data.oi).strike_price
+            support_strike    = max(valid_pe, key=lambda x: _oi(x.put_options)).strike_price
 
         # ── 4. Momentum Trade Pick with OI surge + IV filter ──
         trade_side = "CALL" if is_bullish or (not is_bearish and spot_price > vwap_price) else "PUT"
@@ -276,19 +295,25 @@ if expiry_list and spot_price > 0:
 
         for item in atm_strikes:
             opt_data = item.call_options if trade_side == "CALL" else item.put_options
-            if not opt_data:
+            if not opt_data or not opt_data.market_data:
                 continue
 
-            ikey     = opt_data.instrument_key
-            curr_oi  = opt_data.market_data.oi
-            curr_iv  = getattr(opt_data.market_data, 'iv', None) or getattr(opt_data, 'greeks', None)
+            ikey    = opt_data.instrument_key
+            curr_oi = _safe_float(opt_data.market_data, 'oi') or 0.0
+            curr_ltp= _safe_float(opt_data.market_data, 'ltp') or 0.0
 
-            # Try to extract IV from greeks if available
+            # Skip strikes with zero OI — no meaningful data
+            if curr_oi == 0:
+                continue
+
+            # IV: try greeks first, then market_data
             iv_val = None
-            if hasattr(opt_data, 'greeks') and opt_data.greeks:
-                iv_val = getattr(opt_data.greeks, 'iv', None)
-            if iv_val is None and hasattr(opt_data.market_data, 'iv'):
-                iv_val = opt_data.market_data.iv
+            try:
+                if opt_data.greeks:
+                    iv_val = _safe_float(opt_data.greeks, 'iv')
+            except: pass
+            if iv_val is None:
+                iv_val = _safe_float(opt_data.market_data, 'iv')
 
             # ── Baseline OI: stored once per session start, never overwritten ──
             if ikey not in st.session_state.oi_snapshots:
@@ -298,25 +323,23 @@ if expiry_list and spot_price > 0:
                     "time":        datetime.now()
                 }
 
-            snap         = st.session_state.oi_snapshots[ikey]
-            baseline_oi  = snap["baseline_oi"]
+            snap        = st.session_state.oi_snapshots[ikey]
+            baseline_oi = snap["baseline_oi"]
 
-            # Surge vs session baseline (never resets until app restart)
-            surge_session = ((curr_oi - baseline_oi) / baseline_oi * 100) if baseline_oi > 0 else 0
-            # Surge vs last 60s snapshot
-            surge_tick    = ((curr_oi - snap["prev_oi"]) / snap["prev_oi"] * 100) if snap["prev_oi"] > 0 else 0
+            surge_session = ((curr_oi - baseline_oi) / baseline_oi * 100) if baseline_oi > 0 else 0.0
+            surge_tick    = ((curr_oi - snap["prev_oi"]) / snap["prev_oi"] * 100) if snap["prev_oi"] > 0 else 0.0
 
-            # Update prev_oi for next tick
             st.session_state.oi_snapshots[ikey]["prev_oi"] = curr_oi
 
             options_pool.append({
-                "strike":         f"{item.strike_price} {'CE' if trade_side == 'CALL' else 'PE'}",
-                "strike_price":   item.strike_price,
-                "ltp":            opt_data.market_data.ltp,
-                "surge_session":  surge_session,
-                "surge_tick":     surge_tick,
-                "iv":             round(iv_val, 1) if iv_val else None,
-                "time":           round((datetime.now() - snap["time"]).total_seconds() / 60, 1)
+                "strike":        f"{item.strike_price} {'CE' if trade_side == 'CALL' else 'PE'}",
+                "strike_price":  item.strike_price,
+                "ltp":           curr_ltp,
+                "oi":            curr_oi,
+                "surge_session": surge_session,
+                "surge_tick":    surge_tick,
+                "iv":            round(iv_val, 1) if iv_val else None,
+                "time":          round((datetime.now() - snap["time"]).total_seconds() / 60, 1)
             })
 
         if options_pool:
@@ -496,6 +519,23 @@ if st.session_state.surge_history:
     st.markdown("##### 📈 OI Surge History (Session)")
     df_hist = pd.DataFrame(st.session_state.surge_history)
     st.line_chart(df_hist.set_index("time")["surge"], use_container_width=True, height=160)
+
+# ── Debug Expander (hidden by default) ──
+with st.expander("🔍 Debug Info", expanded=False):
+    st.write(f"**Market Open:** {_mkt_open}")
+    st.write(f"**Spot:** {spot_price} | **VWAP:** {vwap_price:.2f} | **High:** {d_high} | **Low:** {d_low}")
+    st.write(f"**Near PCR:** {pcr_near:.4f}  (CE OI: {total_ce_oi:,.0f} | PE OI: {total_pe_oi:,.0f})")
+    st.write(f"**Far PCR:** {pcr_far:.4f}")
+    st.write(f"**Expiry list:** {expiry_list[:4] if expiry_list else 'EMPTY'}")
+    st.write(f"**Near chain rows:** {len(near_chain) if 'near_chain' in dir() else 'N/A'}")
+    if 'options_pool' in dir() and options_pool:
+        st.dataframe(pd.DataFrame(options_pool))
+    elif 'near_chain' in dir() and near_chain:
+        sample = near_chain[0]
+        st.write("**Sample chain item (first row):**")
+        st.write(f"  Strike: {sample.strike_price}")
+        st.write(f"  CE market_data: {sample.call_options.market_data if sample.call_options else 'None'}")
+        st.write(f"  PE market_data: {sample.put_options.market_data if sample.put_options else 'None'}")
 
 # ── Footer ──
 _sync_label = (
