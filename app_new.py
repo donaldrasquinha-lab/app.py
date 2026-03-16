@@ -127,8 +127,17 @@ def get_expiry_list(index_key):
     try:
         api       = upstox_client.OptionsApi(get_api_client())
         contracts = api.get_option_contracts(index_key)
-        today     = datetime.now().strftime('%Y-%m-%d')
-        result    = sorted(list(set(c.expiry for c in contracts.data if c.expiry >= today)))
+        today     = datetime.now().date()
+        def _to_date(x):
+            if isinstance(x, str):
+                return datetime.strptime(x, '%Y-%m-%d').date()
+            if hasattr(x, 'date'):
+                return x.date()
+            return x  # already a date
+        result    = sorted(list(set(
+            c.expiry if isinstance(c.expiry, str) else c.expiry.strftime('%Y-%m-%d')
+            for c in contracts.data if _to_date(c.expiry) >= today
+        )))
         if result:  # Only cache non-empty results
             st.session_state.last_cache[cache_key] = result
         return result
