@@ -63,13 +63,15 @@ def _safe_float(obj, *attrs):
 
 def get_market_data(index_key):
     """
-    Market hours  → live fetch, update cache.
-    After hours   → return last cached values, skip API entirely.
-    On API error  → fall back to cache.
+    Market hours        → live fetch, update cache.
+    After hours + cache → return last cached values, skip API entirely.
+    After hours, NO cache (first open) → fetch once to populate cache.
+    On API error        → fall back to cache.
     """
     cache = st.session_state.last_cache.get(index_key)
 
-    if not is_market_open() and cache:
+    # Only skip API if cache is fully populated (has real OHLC, not just spot)
+    if not is_market_open() and cache and cache.get("high") != cache.get("spot"):
         return cache["spot"], cache["vwap"], cache["high"], cache["low"]
 
     try:
@@ -109,26 +111,43 @@ def get_market_data(index_key):
         return 0.0, 0.0, 0.0, 0.0
 
 
-@st.cache_data(ttl=3600)
 def get_expiry_list(index_key):
+    """
+    Fetch expiry list. Caches in session_state so it:
+      - Never caches a failed/empty result (unlike @st.cache_data)
+      - Refreshes once per session when market opens
+    """
+    cache_key = f"expiry_{index_key}"
+    cached = st.session_state.last_cache.get(cache_key)
+
+    # Return cached list if it has entries
+    if cached:
+        return cached
+
     try:
-        api      = upstox_client.OptionsApi(get_api_client())
+        api       = upstox_client.OptionsApi(get_api_client())
         contracts = api.get_option_contracts(index_key)
-        today    = datetime.now().strftime('%Y-%m-%d')
-        return sorted(list(set(c.expiry for c in contracts.data if c.expiry >= today)))
-    except:
-        return []
+        today     = datetime.now().strftime('%Y-%m-%d')
+        result    = sorted(list(set(c.expiry for c in contracts.data if c.expiry >= today)))
+        if result:  # Only cache non-empty results
+            st.session_state.last_cache[cache_key] = result
+        return result
+    except Exception as e:
+        st.error(f"Expiry List Error: {e}")
+        return cached or []
 
 
 def fetch_option_chain(index_key, expiry):
     """
-    Market hours  → live fetch, update cache.
-    After hours   → return frozen close-of-day chain from cache.
-    On error      → fall back to cache.
+    Market hours         → live fetch, update cache.
+    After hours + cache  → return frozen close-of-day chain.
+    After hours, no cache→ fetch once to populate.
+    On error             → fall back to cache.
     """
     chain_key    = f"chain_{index_key}_{expiry}"
     cached_chain = st.session_state.last_cache.get(chain_key)
 
+    # Only skip fetch if we already have a populated chain
     if not is_market_open() and cached_chain:
         return cached_chain
 
@@ -219,11 +238,21 @@ selected_key = index_map[index_choice]
 _mkt_open = is_market_open()
 _cache    = st.session_state.last_cache.get(selected_key, {})
 _as_of    = _cache.get("as_of", "—")
-if not _mkt_open:
-    st.warning(
-        f"⏰ {market_status_label()} — showing last closing values as of **{_as_of}**",
-        icon="🔔"
-    )
+
+col_status, col_btn = st.columns([4, 1])
+with col_status:
+    if not _mkt_open:
+        st.warning(
+            f"⏰ {market_status_label()} — showing last closing values as of **{_as_of}**",
+            icon="🔔"
+        )
+with col_btn:
+    if st.button("🔄 Refresh Cache", help="Force re-fetch all data from Upstox"):
+        # Clear only data caches, keep OI snapshots and surge history
+        keys_to_clear = [k for k in st.session_state.last_cache if k != "oi_snapshots"]
+        for k in keys_to_clear:
+            del st.session_state.last_cache[k]
+        st.rerun()
 
 # Fetch Market Data
 spot_price, vwap_price, d_high, d_low = get_market_data(selected_key)
