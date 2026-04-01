@@ -2,3 +2,4 @@ upstox-python-sdk
 streamlit-autorefresh
 streamlit
 pandas
+pytz
