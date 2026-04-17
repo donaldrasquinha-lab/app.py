@@ -17,6 +17,69 @@ if "surge_history" not in st.session_state: st.session_state.surge_history = []
 if "prev_trend"    not in st.session_state: st.session_state.prev_trend    = None
 # ── Last-known-good cache: persists across after-hours refreshes ──
 if "last_cache"    not in st.session_state: st.session_state.last_cache    = {}
+# ── Token from UI input ──
+if "ui_token"      not in st.session_state: st.session_state.ui_token      = ""
+
+
+# ─────────────────────────────────────────────
+#  SIDEBAR — TOKEN MANAGEMENT
+# ─────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 🔑 Upstox Access Token")
+
+    # Determine current token source for display
+    _secrets_token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+    _has_ui_token  = bool(st.session_state.ui_token)
+    _has_secrets   = bool(_secrets_token)
+
+    if _has_ui_token:
+        _active_source = "Dashboard Input"
+        _masked        = st.session_state.ui_token[:6] + "•" * 10 + st.session_state.ui_token[-4:]
+    elif _has_secrets:
+        _active_source = "Streamlit Secrets"
+        _masked        = _secrets_token[:6] + "•" * 10 + _secrets_token[-4:]
+    else:
+        _active_source = "None"
+        _masked        = "—"
+
+    st.markdown(f"""
+    <div style="background:#0f172a; padding:12px; border-radius:8px; border:1px solid #1e293b; margin-bottom:12px;">
+        <div style="color:#64748b; font-size:0.7rem; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Active Token</div>
+        <div style="color:#e2e8f0; font-size:0.82rem; font-family:'IBM Plex Mono',monospace; word-break:break-all;">{_masked}</div>
+        <div style="color:#94a3b8; font-size:0.68rem; margin-top:6px;">Source: <b style="color:#38bdf8;">{_active_source}</b></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.caption("Upstox tokens expire daily. Paste a fresh token below to override secrets.")
+
+    new_token = st.text_input(
+        "Paste Access Token",
+        type="password",
+        placeholder="eyJ0eXAiOiJKV1QiLCJr...",
+        key="token_input_field",
+        label_visibility="collapsed"
+    )
+
+    col_apply, col_clear = st.columns(2)
+    with col_apply:
+        if st.button("✅ Apply Token", use_container_width=True):
+            if new_token and new_token.strip():
+                st.session_state.ui_token = new_token.strip()
+                # Clear data caches so next refresh uses the new token
+                st.session_state.last_cache = {}
+                st.toast("Token applied — data will refresh.", icon="✅")
+                st.rerun()
+            else:
+                st.warning("Paste a token first.")
+    with col_clear:
+        if st.button("🗑️ Clear", use_container_width=True):
+            st.session_state.ui_token = ""
+            st.session_state.last_cache = {}
+            st.toast("UI token cleared — falling back to secrets.", icon="🗑️")
+            st.rerun()
+
+    st.divider()
+    st.caption("💡 **Tip:** Generate your daily token from the [Upstox Developer Console](https://account.upstox.com/developer/apps) and paste it here each morning.")
 
 
 # ─────────────────────────────────────────────
@@ -37,10 +100,15 @@ def market_status_label() -> str:
 
 
 # --- API HELPERS ---
+def _resolve_token() -> str:
+    """Priority: UI-pasted token > Streamlit secrets."""
+    return st.session_state.ui_token or st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+
+
 def get_api_client():
-    token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+    token = _resolve_token()
     if not token:
-        st.error("⚠️ UPSTOX_ACCESS_TOKEN is missing from Streamlit secrets.")
+        st.error("⚠️ No access token found. Paste one in the sidebar or set UPSTOX_ACCESS_TOKEN in secrets.")
         st.stop()
     config = upstox_client.Configuration()
     config.access_token = token
@@ -85,19 +153,53 @@ def get_market_data(index_key):
         ohlc_obj  = safe_get_instrument(ohlc_resp.data, index_key)
         vwap_val, day_high, day_low = spot, spot, spot
 
-        # Upstox OHLC structure: ohlc_obj.ohlc.open / .high / .low / .close
-        # Also handle alternate attribute names gracefully
-        prices = getattr(ohlc_obj, 'ohlc', None) if ohlc_obj else None
-        if prices:
-            h = _safe_float(prices, 'high')
-            l = _safe_float(prices, 'low')
-            c = _safe_float(prices, 'close')
-            if h and l and c:
-                vwap_val = (h + l + c * 2) / 4
-                day_high = h
-                day_low  = l
+        # ── Extract H/L/C from Upstox OHLC response ──
+        # Upstox V3 can return ohlc as:
+        #   a) A list of interval dicts/objects → take the first element
+        #   b) A single object with .high/.low/.close attrs
+        #   c) A dict with 'high'/'low'/'close' keys
+        h, l, c = None, None, None
+        if ohlc_obj:
+            raw_ohlc = getattr(ohlc_obj, 'ohlc', None)
 
-        # Always overwrite cache with freshest live values
+            # Case A: list of candle objects → unwrap first element
+            if isinstance(raw_ohlc, list) and len(raw_ohlc) > 0:
+                candle = raw_ohlc[0]
+                h = _safe_float(candle, 'high')
+                l = _safe_float(candle, 'low')
+                c = _safe_float(candle, 'close')
+
+            # Case B: single object with attrs
+            elif raw_ohlc and hasattr(raw_ohlc, 'high'):
+                h = _safe_float(raw_ohlc, 'high')
+                l = _safe_float(raw_ohlc, 'low')
+                c = _safe_float(raw_ohlc, 'close')
+
+            # Case C: dict
+            elif isinstance(raw_ohlc, dict):
+                h = float(raw_ohlc.get('high', 0)) or None
+                l = float(raw_ohlc.get('low', 0)) or None
+                c = float(raw_ohlc.get('close', 0)) or None
+
+            # Fallback: check top-level attrs on ohlc_obj itself
+            if not h:
+                h = _safe_float(ohlc_obj, 'high')
+                l = _safe_float(ohlc_obj, 'low')
+                c = _safe_float(ohlc_obj, 'close')
+
+        if h and l and c:
+            vwap_val = (h + l + c * 2) / 4
+            day_high = h
+            day_low  = l
+
+        # Store debug info for OHLC structure inspection
+        st.session_state.last_cache[f"_debug_ohlc_{index_key}"] = {
+            "ohlc_obj_type": str(type(ohlc_obj)) if ohlc_obj else "None",
+            "raw_ohlc_type": str(type(getattr(ohlc_obj, 'ohlc', None))) if ohlc_obj else "None",
+            "raw_ohlc_repr": repr(getattr(ohlc_obj, 'ohlc', None))[:500] if ohlc_obj else "None",
+            "extracted": {"h": h, "l": l, "c": c},
+        }
+
         st.session_state.last_cache[index_key] = {
             "spot": spot, "vwap": vwap_val, "high": day_high, "low": day_low,
             "as_of": datetime.now(IST).strftime("%d %b %H:%M IST")
@@ -112,15 +214,9 @@ def get_market_data(index_key):
 
 
 def get_expiry_list(index_key):
-    """
-    Fetch expiry list. Caches in session_state so it:
-      - Never caches a failed/empty result (unlike @st.cache_data)
-      - Refreshes once per session when market opens
-    """
     cache_key = f"expiry_{index_key}"
     cached = st.session_state.last_cache.get(cache_key)
 
-    # Return cached list if it has entries
     if cached:
         return cached
 
@@ -133,12 +229,12 @@ def get_expiry_list(index_key):
                 return datetime.strptime(x, '%Y-%m-%d').date()
             if hasattr(x, 'date'):
                 return x.date()
-            return x  # already a date
+            return x
         result    = sorted(list(set(
             c.expiry if isinstance(c.expiry, str) else c.expiry.strftime('%Y-%m-%d')
             for c in contracts.data if _to_date(c.expiry) >= today
         )))
-        if result:  # Only cache non-empty results
+        if result:
             st.session_state.last_cache[cache_key] = result
         return result
     except Exception as e:
@@ -147,16 +243,9 @@ def get_expiry_list(index_key):
 
 
 def fetch_option_chain(index_key, expiry):
-    """
-    Market hours         → live fetch, update cache.
-    After hours + cache  → return frozen close-of-day chain.
-    After hours, no cache→ fetch once to populate.
-    On error             → fall back to cache.
-    """
     chain_key    = f"chain_{index_key}_{expiry}"
     cached_chain = st.session_state.last_cache.get(chain_key)
 
-    # Only skip fetch if we already have a populated chain
     if not is_market_open() and cached_chain:
         return cached_chain
 
@@ -230,6 +319,10 @@ st.markdown("""
     .surge-zero{ color: #94a3b8; }
 
     .metric-label { color: #64748b; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 4px; font-family: 'IBM Plex Mono', monospace; }
+
+    /* ── Sidebar styling ── */
+    [data-testid="stSidebar"] { background-color: #0a0f1e !important; }
+    [data-testid="stSidebar"] .stMarkdown h3 { color: #e2e8f0 !important; font-family: 'IBM Plex Mono', monospace; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -257,7 +350,6 @@ with col_status:
         )
 with col_btn:
     if st.button("🔄 Refresh Cache", help="Force re-fetch all data from Upstox"):
-        # Clear only data caches, keep OI snapshots and surge history
         keys_to_clear = [k for k in st.session_state.last_cache if k != "oi_snapshots"]
         for k in keys_to_clear:
             del st.session_state.last_cache[k]
@@ -280,16 +372,12 @@ iv_info = {}
 # --- CORE LOGIC ---
 if expiry_list and spot_price > 0:
     try:
-        # ── Nearest expiry chain (for OI surge & momentum pick) ──
         near_expiry = expiry_list[0]
         near_chain  = fetch_option_chain(selected_key, near_expiry)
 
-        # ── Far expiry chain (monthly, for multi-expiry PCR) ──
-        # Pick the expiry that is ~4 weeks out if available, else last available
         far_expiry  = expiry_list[min(3, len(expiry_list) - 1)]
         far_chain   = fetch_option_chain(selected_key, far_expiry) if far_expiry != near_expiry else []
 
-        # ── 1. Aggregate OI  (safe access — market_data or oi may be None) ──
         def _oi(opt):
             try: return float(opt.market_data.oi or 0)
             except: return 0.0
@@ -305,7 +393,6 @@ if expiry_list and spot_price > 0:
         pcr_near = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
         pcr_far  = far_pe_oi   / far_ce_oi   if far_ce_oi   > 0 else 0
 
-        # ── 2. Trend Determination with PCR band (0.8–1.2 = sideways zone) ──
         is_bullish = (spot_price > vwap_price) and (pcr_near > 1.2)
         is_bearish = (spot_price < vwap_price) and (pcr_near < 0.8)
 
@@ -313,12 +400,10 @@ if expiry_list and spot_price > 0:
         trend_class  = "uptrend-bg"   if is_bullish else "downtrend-bg" if is_bearish else "sideways-bg"
         trend_color  = "#22c55e"      if is_bullish else "#ef4444"      if is_bearish else "#94a3b8"
 
-        # ── Toast alert on trend change ──
         if st.session_state.prev_trend and st.session_state.prev_trend != trend_status:
             st.toast(f"⚡ Trend flipped: {st.session_state.prev_trend} → {trend_status}", icon="🔔")
         st.session_state.prev_trend = trend_status
 
-        # ── 3. Support & Resistance from Max OI strikes ──
         valid_ce = [i for i in near_chain if i.call_options and _oi(i.call_options) > 0]
         valid_pe = [i for i in near_chain if i.put_options  and _oi(i.put_options)  > 0]
         if valid_ce:
@@ -326,7 +411,6 @@ if expiry_list and spot_price > 0:
         if valid_pe:
             support_strike    = max(valid_pe, key=lambda x: _oi(x.put_options)).strike_price
 
-        # ── 4. Momentum Trade Pick with OI surge + IV filter ──
         trade_side = "CALL" if is_bullish or (not is_bearish and spot_price > vwap_price) else "PUT"
         atm_strikes = sorted(near_chain, key=lambda x: abs(x.strike_price - spot_price))[:5]
         options_pool = []
@@ -340,11 +424,9 @@ if expiry_list and spot_price > 0:
             curr_oi = _safe_float(opt_data.market_data, 'oi') or 0.0
             curr_ltp= _safe_float(opt_data.market_data, 'ltp') or 0.0
 
-            # Skip strikes with zero OI — no meaningful data
             if curr_oi == 0:
                 continue
 
-            # IV: try greeks first, then market_data
             iv_val = None
             try:
                 if opt_data.greeks:
@@ -353,7 +435,6 @@ if expiry_list and spot_price > 0:
             if iv_val is None:
                 iv_val = _safe_float(opt_data.market_data, 'iv')
 
-            # ── Baseline OI: stored once per session start, never overwritten ──
             if ikey not in st.session_state.oi_snapshots:
                 st.session_state.oi_snapshots[ikey] = {
                     "baseline_oi": curr_oi,
@@ -381,16 +462,13 @@ if expiry_list and spot_price > 0:
             })
 
         if options_pool:
-            # Filter out high-IV outliers (>1.5x median IV) if IV data available
             iv_vals = [o["iv"] for o in options_pool if o["iv"] is not None]
             if len(iv_vals) >= 2:
                 median_iv = sorted(iv_vals)[len(iv_vals) // 2]
                 options_pool = [o for o in options_pool if o["iv"] is None or o["iv"] <= median_iv * 1.5]
 
-            # Rank by session-level OI surge
             best_trade = max(options_pool, key=lambda x: x['surge_session'])
 
-            # ── 5. Rolling surge history (keep last 20 entries) ──
             st.session_state.surge_history.append({
                 "time":   datetime.now().strftime("%H:%M"),
                 "strike": best_trade["strike"],
@@ -424,7 +502,6 @@ def surge_color(val):
 def vwap_color(spot, vwap):
     return "#4ade80" if spot > vwap else "#f87171"
 
-# Derive per-PCR sentiment booleans
 near_bull = pcr_near > 1.2
 near_bear = pcr_near < 0.8
 far_bull  = pcr_far  > 1.2
@@ -440,7 +517,6 @@ spot_delta_color = vwap_color(spot_price, vwap_price)
 #  UI
 # ═══════════════════════════════════════════════════════
 
-# ── Overall Trend Banner ──
 vwap_label_color = "#4ade80" if spot_price > vwap_price else "#f87171"
 vwap_arrow       = "▲ ABOVE" if spot_price > vwap_price else "▼ BELOW"
 
@@ -461,7 +537,6 @@ st.markdown(f"""
     </div>
     """, unsafe_allow_html=True)
 
-# ── Metrics Row (sentiment-tinted tiles) ──
 spot_delta     = spot_price - vwap_price
 spot_val_color = "#4ade80" if spot_delta >= 0 else "#f87171"
 
@@ -495,7 +570,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Support & Resistance ──
 if support_strike or resistance_strike:
     st.markdown("##### Key S/R Levels (Max OI)")
     sr_html = ""
@@ -508,13 +582,12 @@ if support_strike or resistance_strike:
     st.markdown(sr_html, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-# ── Trade Pick Card ──
 if best_trade:
     s = best_trade
     iv_display     = f"{s['iv']}%" if s['iv'] else "N/A"
     sess_color     = surge_color(s['surge_session'])
     tick_color     = surge_color(s['surge_tick'])
-    ltp_color      = trend_color  # LTP label tinted by overall sentiment
+    ltp_color      = trend_color
 
     st.markdown(f"""
     <div class="card {card_class}">
@@ -552,16 +625,18 @@ if best_trade:
 else:
     st.info("Gathering live data... Wait for the next 60s cycle to calculate OI surge.")
 
-# ── OI Surge History Chart ──
 if st.session_state.surge_history:
     st.markdown("##### 📈 OI Surge History (Session)")
     df_hist = pd.DataFrame(st.session_state.surge_history)
     st.line_chart(df_hist.set_index("time")["surge"], use_container_width=True, height=160)
 
-# ── Debug Expander (hidden by default) ──
 with st.expander("🔍 Debug Info", expanded=False):
+    st.write(f"**Token Source:** {'Dashboard Input' if st.session_state.ui_token else 'Streamlit Secrets'}")
     st.write(f"**Market Open:** {_mkt_open}")
     st.write(f"**Spot:** {spot_price} | **VWAP:** {vwap_price:.2f} | **High:** {d_high} | **Low:** {d_low}")
+    _ohlc_debug = st.session_state.last_cache.get(f"_debug_ohlc_{selected_key}")
+    if _ohlc_debug:
+        st.write("**OHLC Debug:**", _ohlc_debug)
     st.write(f"**Near PCR:** {pcr_near:.4f}  (CE OI: {total_ce_oi:,.0f} | PE OI: {total_pe_oi:,.0f})")
     st.write(f"**Far PCR:** {pcr_far:.4f}")
     st.write(f"**Expiry list:** {expiry_list[:4] if expiry_list else 'EMPTY'}")
@@ -575,7 +650,6 @@ with st.expander("🔍 Debug Info", expanded=False):
         st.write(f"  CE market_data: {sample.call_options.market_data if sample.call_options else 'None'}")
         st.write(f"  PE market_data: {sample.put_options.market_data if sample.put_options else 'None'}")
 
-# ── Footer ──
 _sync_label = (
     f"Live Sync: {datetime.now(IST).strftime('%H:%M:%S IST')}"
     if _mkt_open else
