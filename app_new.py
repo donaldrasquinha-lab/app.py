@@ -145,7 +145,7 @@ def get_market_data(index_key):
     try:
         api       = upstox_client.MarketQuoteV3Api(get_api_client())
         ltp_resp  = api.get_ltp(instrument_key=index_key)
-        ohlc_resp = api.get_market_quote_ohlc(instrument_key=index_key, interval="1d")
+        ohlc_resp = api.get_market_quote_ohlc("1d", instrument_key=index_key)
 
         spot_obj  = safe_get_instrument(ltp_resp.data, index_key)
         spot      = _safe_float(spot_obj, 'last_price') or 0.0
@@ -154,50 +154,75 @@ def get_market_data(index_key):
         vwap_val, day_high, day_low = spot, spot, spot
 
         # ── Extract H/L/C from Upstox OHLC response ──
-        # Upstox V3 can return ohlc as:
-        #   a) A list of interval dicts/objects → take the first element
-        #   b) A single object with .high/.low/.close attrs
-        #   c) A dict with 'high'/'low'/'close' keys
+        # V3 API returns: { live_ohlc: {open,high,low,close,volume,ts}, prev_ohlc: {...}, last_price, instrument_token }
+        # V2 API returns: { ohlc: {open,high,low,close}, last_price, instrument_token }
         h, l, c = None, None, None
+        _debug_source = "none"
+
         if ohlc_obj:
-            raw_ohlc = getattr(ohlc_obj, 'ohlc', None)
+            # ── Priority 1: V3 live_ohlc (current day's candle) ──
+            live_ohlc = getattr(ohlc_obj, 'live_ohlc', None)
+            if live_ohlc:
+                h = _safe_float(live_ohlc, 'high')
+                l = _safe_float(live_ohlc, 'low')
+                c = _safe_float(live_ohlc, 'close')
+                if h and l and h != l:
+                    _debug_source = "live_ohlc"
 
-            # Case A: list of candle objects → unwrap first element
-            if isinstance(raw_ohlc, list) and len(raw_ohlc) > 0:
-                candle = raw_ohlc[0]
-                h = _safe_float(candle, 'high')
-                l = _safe_float(candle, 'low')
-                c = _safe_float(candle, 'close')
+            # ── Priority 2: V3 prev_ohlc (use after hours when live == flat) ──
+            if not h or h == l:
+                prev_ohlc = getattr(ohlc_obj, 'prev_ohlc', None)
+                if prev_ohlc:
+                    ph = _safe_float(prev_ohlc, 'high')
+                    pl = _safe_float(prev_ohlc, 'low')
+                    pc = _safe_float(prev_ohlc, 'close')
+                    if ph and pl and ph != pl:
+                        h, l, c = ph, pl, pc
+                        _debug_source = "prev_ohlc"
 
-            # Case B: single object with attrs
-            elif raw_ohlc and hasattr(raw_ohlc, 'high'):
-                h = _safe_float(raw_ohlc, 'high')
-                l = _safe_float(raw_ohlc, 'low')
-                c = _safe_float(raw_ohlc, 'close')
+            # ── Priority 3: V2 ohlc object ──
+            if not h or h == l:
+                raw_ohlc = getattr(ohlc_obj, 'ohlc', None)
+                if raw_ohlc:
+                    # Could be a list (market feed style) or single object
+                    candle = raw_ohlc[0] if isinstance(raw_ohlc, list) and len(raw_ohlc) > 0 else raw_ohlc
+                    if isinstance(candle, dict):
+                        h = float(candle.get('high', 0)) or None
+                        l = float(candle.get('low', 0)) or None
+                        c = float(candle.get('close', 0)) or None
+                    elif hasattr(candle, 'high'):
+                        h = _safe_float(candle, 'high')
+                        l = _safe_float(candle, 'low')
+                        c = _safe_float(candle, 'close')
+                    if h and l and h != l:
+                        _debug_source = "ohlc (v2)"
 
-            # Case C: dict
-            elif isinstance(raw_ohlc, dict):
-                h = float(raw_ohlc.get('high', 0)) or None
-                l = float(raw_ohlc.get('low', 0)) or None
-                c = float(raw_ohlc.get('close', 0)) or None
+            # ── Priority 4: top-level attrs ──
+            if not h or h == l:
+                th = _safe_float(ohlc_obj, 'high')
+                tl = _safe_float(ohlc_obj, 'low')
+                tc = _safe_float(ohlc_obj, 'close')
+                if th and tl and th != tl:
+                    h, l, c = th, tl, tc
+                    _debug_source = "top-level"
 
-            # Fallback: check top-level attrs on ohlc_obj itself
-            if not h:
-                h = _safe_float(ohlc_obj, 'high')
-                l = _safe_float(ohlc_obj, 'low')
-                c = _safe_float(ohlc_obj, 'close')
-
-        if h and l and c:
+        if h and l and c and h != l:
             vwap_val = (h + l + c * 2) / 4
             day_high = h
             day_low  = l
 
         # Store debug info for OHLC structure inspection
         st.session_state.last_cache[f"_debug_ohlc_{index_key}"] = {
-            "ohlc_obj_type": str(type(ohlc_obj)) if ohlc_obj else "None",
-            "raw_ohlc_type": str(type(getattr(ohlc_obj, 'ohlc', None))) if ohlc_obj else "None",
-            "raw_ohlc_repr": repr(getattr(ohlc_obj, 'ohlc', None))[:500] if ohlc_obj else "None",
-            "extracted": {"h": h, "l": l, "c": c},
+            "ohlc_obj_type":   str(type(ohlc_obj)) if ohlc_obj else "None",
+            "source_used":     _debug_source,
+            "has_live_ohlc":   hasattr(ohlc_obj, 'live_ohlc') if ohlc_obj else False,
+            "has_prev_ohlc":   hasattr(ohlc_obj, 'prev_ohlc') if ohlc_obj else False,
+            "has_ohlc":        hasattr(ohlc_obj, 'ohlc') if ohlc_obj else False,
+            "live_ohlc_repr":  repr(getattr(ohlc_obj, 'live_ohlc', None))[:300] if ohlc_obj else "None",
+            "prev_ohlc_repr":  repr(getattr(ohlc_obj, 'prev_ohlc', None))[:300] if ohlc_obj else "None",
+            "ohlc_repr":       repr(getattr(ohlc_obj, 'ohlc', None))[:300] if ohlc_obj else "None",
+            "all_attrs":       [a for a in dir(ohlc_obj) if not a.startswith('_')][:20] if ohlc_obj else [],
+            "extracted":       {"h": h, "l": l, "c": c},
         }
 
         st.session_state.last_cache[index_key] = {
@@ -331,7 +356,15 @@ st.title("🏹 Price Action & Sentiment Radar")
 index_map = {
     "Nifty 50":   "NSE_INDEX|Nifty 50",
     "Nifty Bank":  "NSE_INDEX|Nifty Bank",
-    "FINNIFTY":    "NSE_INDEX|Nifty Fin Service"
+    "FINNIFTY":    "NSE_INDEX|Nifty Fin Service",
+    "Sensex":      "BSE_INDEX|SENSEX"
+}
+
+# Indices that have NSE option chains
+OPTION_CHAIN_INDICES = {
+    "NSE_INDEX|Nifty 50",
+    "NSE_INDEX|Nifty Bank",
+    "NSE_INDEX|Nifty Fin Service",
 }
 index_choice = st.selectbox("Select Index", list(index_map.keys()))
 selected_key = index_map[index_choice]
@@ -357,7 +390,10 @@ with col_btn:
 
 # Fetch Market Data
 spot_price, vwap_price, d_high, d_low = get_market_data(selected_key)
-expiry_list = get_expiry_list(selected_key)
+
+# Option chains only available for NSE indices
+has_options = selected_key in OPTION_CHAIN_INDICES
+expiry_list = get_expiry_list(selected_key) if has_options else []
 
 # --- INITIALIZE DEFAULTS ---
 trend_status = "INITIALIZING"
@@ -480,6 +516,18 @@ if expiry_list and spot_price > 0:
     except Exception as e:
         st.error(f"Logic Error: {e}")
 
+# ── Fallback: VWAP-only trend for indices without option chains (e.g. Sensex) ──
+elif not has_options and spot_price > 0:
+    is_bullish = spot_price > vwap_price
+    is_bearish = spot_price < vwap_price
+    trend_status = "UPTREND" if is_bullish else "DOWNTREND" if is_bearish else "SIDEWAYS"
+    trend_class  = "uptrend-bg"   if is_bullish else "downtrend-bg" if is_bearish else "sideways-bg"
+    trend_color  = "#22c55e"      if is_bullish else "#ef4444"      if is_bearish else "#94a3b8"
+
+    if st.session_state.prev_trend and st.session_state.prev_trend != trend_status:
+        st.toast(f"⚡ Trend flipped: {st.session_state.prev_trend} → {trend_status}", icon="🔔")
+    st.session_state.prev_trend = trend_status
+
 
 # ═══════════════════════════════════════════════════════
 #  SENTIMENT COLOR HELPERS
@@ -529,10 +577,10 @@ st.markdown(f"""
         </div>
         <div style="font-size:0.82rem; font-family:'IBM Plex Mono',monospace; margin-top:4px;">
             <span style="color:{vwap_label_color}; font-weight:600;">{vwap_arrow} VWAP</span>
-            <span style="color:#475569;"> &nbsp;|&nbsp; </span>
+            {f'''<span style="color:#475569;"> &nbsp;|&nbsp; </span>
             <span style="color:#64748b;">PCR Near</span> {pcr_pill(pcr_near)}
             <span style="color:#475569;"> &nbsp;|&nbsp; </span>
-            <span style="color:#64748b;">PCR Far</span> {pcr_pill(pcr_far)}
+            <span style="color:#64748b;">PCR Far</span> {pcr_pill(pcr_far)}''' if has_options else '<span style="color:#475569;"> &nbsp;|&nbsp; </span><span style="color:#64748b;">VWAP-only trend (no options data)</span>'}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -540,37 +588,63 @@ st.markdown(f"""
 spot_delta     = spot_price - vwap_price
 spot_val_color = "#4ade80" if spot_delta >= 0 else "#f87171"
 
-st.markdown(f"""
-<div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:12px; margin-bottom:20px;">
+if has_options:
+    st.markdown(f"""
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:12px; margin-bottom:20px;">
 
-  <div class="{tile_class(is_bull, is_bear)}">
-    <div class="metric-label">Live Spot</div>
-    <div style="color:white; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">₹{spot_price:,.2f}</div>
-    <div style="color:{spot_val_color}; font-size:0.75rem; font-family:'IBM Plex Mono',monospace; margin-top:4px;">{spot_delta:+.2f} vs VWAP</div>
-  </div>
+      <div class="{tile_class(is_bull, is_bear)}">
+        <div class="metric-label">Live Spot</div>
+        <div style="color:white; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">₹{spot_price:,.2f}</div>
+        <div style="color:{spot_val_color}; font-size:0.75rem; font-family:'IBM Plex Mono',monospace; margin-top:4px;">{spot_delta:+.2f} vs VWAP</div>
+      </div>
 
-  <div class="{tile_class(near_bull, near_bear)}">
-    <div class="metric-label">PCR (Near)</div>
-    <div style="color:{'#4ade80' if near_bull else '#f87171' if near_bear else '#94a3b8'}; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">{pcr_near:.2f}</div>
-    <div style="color:{'#4ade80' if near_bull else '#f87171' if near_bear else '#94a3b8'}; font-size:0.72rem; margin-top:4px;">{'▲ Bullish' if near_bull else '▼ Bearish' if near_bear else '◆ Neutral'}</div>
-  </div>
+      <div class="{tile_class(near_bull, near_bear)}">
+        <div class="metric-label">PCR (Near)</div>
+        <div style="color:{'#4ade80' if near_bull else '#f87171' if near_bear else '#94a3b8'}; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">{pcr_near:.2f}</div>
+        <div style="color:{'#4ade80' if near_bull else '#f87171' if near_bear else '#94a3b8'}; font-size:0.72rem; margin-top:4px;">{'▲ Bullish' if near_bull else '▼ Bearish' if near_bear else '◆ Neutral'}</div>
+      </div>
 
-  <div class="{tile_class(far_bull, far_bear)}">
-    <div class="metric-label">PCR (Far)</div>
-    <div style="color:{'#4ade80' if far_bull else '#f87171' if far_bear else '#94a3b8'}; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">{pcr_far:.2f}</div>
-    <div style="color:{'#4ade80' if far_bull else '#f87171' if far_bear else '#94a3b8'}; font-size:0.72rem; margin-top:4px;">{'▲ Bullish' if far_bull else '▼ Bearish' if far_bear else '◆ Neutral'}</div>
-  </div>
+      <div class="{tile_class(far_bull, far_bear)}">
+        <div class="metric-label">PCR (Far)</div>
+        <div style="color:{'#4ade80' if far_bull else '#f87171' if far_bear else '#94a3b8'}; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">{pcr_far:.2f}</div>
+        <div style="color:{'#4ade80' if far_bull else '#f87171' if far_bear else '#94a3b8'}; font-size:0.72rem; margin-top:4px;">{'▲ Bullish' if far_bull else '▼ Bearish' if far_bear else '◆ Neutral'}</div>
+      </div>
 
-  <div class="tile-neut">
-    <div class="metric-label">Day Range</div>
-    <div style="color:#4ade80; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">H ₹{d_high:,.0f}</div>
-    <div style="color:#f87171; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">L ₹{d_low:,.0f}</div>
-  </div>
+      <div class="tile-neut">
+        <div class="metric-label">Day Range</div>
+        <div style="color:#4ade80; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">H ₹{d_high:,.0f}</div>
+        <div style="color:#f87171; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">L ₹{d_low:,.0f}</div>
+      </div>
 
-</div>
-""", unsafe_allow_html=True)
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    # Sensex / indices without options — simpler 3-column layout
+    st.markdown(f"""
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:20px;">
 
-if support_strike or resistance_strike:
+      <div class="{tile_class(is_bull, is_bear)}">
+        <div class="metric-label">Live Spot</div>
+        <div style="color:white; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">₹{spot_price:,.2f}</div>
+        <div style="color:{spot_val_color}; font-size:0.75rem; font-family:'IBM Plex Mono',monospace; margin-top:4px;">{spot_delta:+.2f} vs VWAP</div>
+      </div>
+
+      <div class="{tile_class(is_bull, is_bear)}">
+        <div class="metric-label">VWAP</div>
+        <div style="color:{vwap_txt_color}; font-size:1.3rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">₹{vwap_price:,.2f}</div>
+        <div style="color:#64748b; font-size:0.72rem; margin-top:4px;">Weighted Avg</div>
+      </div>
+
+      <div class="tile-neut">
+        <div class="metric-label">Day Range</div>
+        <div style="color:#4ade80; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">H ₹{d_high:,.0f}</div>
+        <div style="color:#f87171; font-size:1.1rem; font-weight:700; font-family:'IBM Plex Mono',monospace;">L ₹{d_low:,.0f}</div>
+      </div>
+
+    </div>
+    """, unsafe_allow_html=True)
+
+if has_options and (support_strike or resistance_strike):
     st.markdown("##### Key S/R Levels (Max OI)")
     sr_html = ""
     if support_strike:
@@ -582,7 +656,7 @@ if support_strike or resistance_strike:
     st.markdown(sr_html, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-if best_trade:
+if has_options and best_trade:
     s = best_trade
     iv_display     = f"{s['iv']}%" if s['iv'] else "N/A"
     sess_color     = surge_color(s['surge_session'])
@@ -622,33 +696,39 @@ if best_trade:
         </div>
     </div>
     """, unsafe_allow_html=True)
-else:
+elif has_options:
     st.info("Gathering live data... Wait for the next 60s cycle to calculate OI surge.")
+elif not has_options:
+    st.info(f"📊 {index_choice} is a BSE index — option chain data (PCR, OI, S/R, momentum pick) is not available. Showing VWAP-based trend only.")
 
-if st.session_state.surge_history:
+if has_options and st.session_state.surge_history:
     st.markdown("##### 📈 OI Surge History (Session)")
     df_hist = pd.DataFrame(st.session_state.surge_history)
     st.line_chart(df_hist.set_index("time")["surge"], use_container_width=True, height=160)
 
 with st.expander("🔍 Debug Info", expanded=False):
     st.write(f"**Token Source:** {'Dashboard Input' if st.session_state.ui_token else 'Streamlit Secrets'}")
+    st.write(f"**Has Options:** {has_options}")
     st.write(f"**Market Open:** {_mkt_open}")
     st.write(f"**Spot:** {spot_price} | **VWAP:** {vwap_price:.2f} | **High:** {d_high} | **Low:** {d_low}")
     _ohlc_debug = st.session_state.last_cache.get(f"_debug_ohlc_{selected_key}")
     if _ohlc_debug:
         st.write("**OHLC Debug:**", _ohlc_debug)
-    st.write(f"**Near PCR:** {pcr_near:.4f}  (CE OI: {total_ce_oi:,.0f} | PE OI: {total_pe_oi:,.0f})")
-    st.write(f"**Far PCR:** {pcr_far:.4f}")
-    st.write(f"**Expiry list:** {expiry_list[:4] if expiry_list else 'EMPTY'}")
-    st.write(f"**Near chain rows:** {len(near_chain) if 'near_chain' in dir() else 'N/A'}")
-    if 'options_pool' in dir() and options_pool:
-        st.dataframe(pd.DataFrame(options_pool))
-    elif 'near_chain' in dir() and near_chain:
-        sample = near_chain[0]
-        st.write("**Sample chain item (first row):**")
-        st.write(f"  Strike: {sample.strike_price}")
-        st.write(f"  CE market_data: {sample.call_options.market_data if sample.call_options else 'None'}")
-        st.write(f"  PE market_data: {sample.put_options.market_data if sample.put_options else 'None'}")
+    if has_options:
+        st.write(f"**Near PCR:** {pcr_near:.4f}  (CE OI: {total_ce_oi:,.0f} | PE OI: {total_pe_oi:,.0f})")
+        st.write(f"**Far PCR:** {pcr_far:.4f}")
+        st.write(f"**Expiry list:** {expiry_list[:4] if expiry_list else 'EMPTY'}")
+        st.write(f"**Near chain rows:** {len(near_chain) if 'near_chain' in dir() else 'N/A'}")
+        if 'options_pool' in dir() and options_pool:
+            st.dataframe(pd.DataFrame(options_pool))
+        elif 'near_chain' in dir() and near_chain:
+            sample = near_chain[0]
+            st.write("**Sample chain item (first row):**")
+            st.write(f"  Strike: {sample.strike_price}")
+            st.write(f"  CE market_data: {sample.call_options.market_data if sample.call_options else 'None'}")
+            st.write(f"  PE market_data: {sample.put_options.market_data if sample.put_options else 'None'}")
+
+_logic_label = "PCR Band (0.8/1.2) + Weighted VWAP + Max-OI S/R + IV Filter" if has_options else "VWAP-only trend (no options data for this index)"
 
 _sync_label = (
     f"Live Sync: {datetime.now(IST).strftime('%H:%M:%S IST')}"
@@ -658,5 +738,5 @@ _sync_label = (
 st.caption(
     f"{_sync_label} | "
     f"VWAP: ₹{vwap_price:,.2f} | "
-    f"Logic: PCR Band (0.8/1.2) + Weighted VWAP + Max-OI S/R + IV Filter"
+    f"Logic: {_logic_label}"
 )
